@@ -1,1 +1,455 @@
+import os
+import numpy as np
+import matplotlib.pyplot as plt
 
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from sklearn.metrics import roc_auc_score
+from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
+import torch.nn.functional as F
+
+os.environ["CUDA_DEVICE_ORDER"]="PCI_BUS_ID"  # Arrange GPU devices starting from 0
+os.environ["CUDA_VISIBLE_DEVICES"]= "0, 1, 2"  # Set the GPUs 2 and 3 to use
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print('Device:', device)
+print('Current cuda device:', torch.cuda.current_device())
+print('Count of using GPUs:', torch.cuda.device_count())
+torch.cuda.manual_seed_all(42)
+
+def gaussian_kernel1d(kernel_size, sigma):
+    # kernel_size는 홀수여야 함
+    x = torch.arange(kernel_size, dtype=torch.float32) - (kernel_size - 1) / 2.0
+    kernel = torch.exp(-0.5 * (x / sigma) ** 2)
+    kernel = kernel / kernel.sum()  # 합이 1이 되도록 정규화
+    return kernel
+
+def smooth_label_signal(signal, kernel_size=11, sigma=2.0):
+    kernel = gaussian_kernel1d(kernel_size, sigma).to(signal.device)
+    kernel = kernel.view(1, 1, kernel_size)  # conv1d용 shape
+    padding = kernel_size // 2  # 입력과 출력 길이 동일하게 유지
+    smoothed_signal = F.conv1d(signal, kernel, padding=padding)
+    return smoothed_signal
+
+def replace_zeros_with_random_torch(tensor, low=0.0, high=0.1, seed=42):
+    torch.manual_seed(seed)
+    mask = tensor <= 0.1
+    # mask가 True인 위치에 대해 랜덤 값을 생성해서 대입
+    random_vals = torch.empty(mask.sum(), device=tensor.device).uniform_(low, high)
+    tensor[mask] = random_vals
+    return tensor
+
+def Data_preprocessing(needle_dis, seq_len, file_dir, range_list):
+    x_seq = []
+    y_seq = []
+    motor_x_seq = []
+    
+    for ind in needle_dis:
+        for i in range_list:
+            try:
+                file_path = os.path.join(file_dir, f'T2D_{ind}/SavedData_{i:03d}.bin')
+                with open(file_path, 'rb') as file1:
+                    data = np.frombuffer(file1.read(), dtype=np.float32).reshape(-1, 5).T.copy()
+                    nor_x = data[0] - data[0][0]
+                    
+                    # 🔍 디버깅: 초기 데이터 체크
+                    print(f"\n=== {ind}_{i} 처리 중 ===")
+                    print(f"Raw data[0] range: [{data[0].min():.3f}, {data[0].max():.3f}]")
+                    print(f"Normalized nor_x range: [{nor_x.min():.3f}, {nor_x.max():.3f}]")
+                    
+                    # 🔍 NaN/Inf 체크
+                    if np.isnan(nor_x).any() or np.isinf(nor_x).any():
+                        print(f"⚠️ Invalid values in nor_x for {ind}_{i}")
+                        continue
+                        
+                    indices = np.where(data[4] == 1)[0]
+                    print(f"Puncture indices: {indices}")
+                    
+                    if len(indices) < 2:
+                        print(f"⚠️ Less than 2 puncture points found in {ind}_{i}")
+                        continue
+                    
+                    array_size = len(data[4])
+                    label_array = np.full(array_size, 0, dtype=np.float32)
+                    label_array[indices[1]-20 : indices[1]+20] = 1
+                    
+                    print(f"Original label_array: min={label_array.min():.3f}, max={label_array.max():.3f}, sum={label_array.sum():.0f}")
+                    
+                    if ind == '0600':
+                        try:
+                            # 임계값을 초과하는 데이터의 인덱스 찾기
+                            indices_high = np.where(data[0] > 3.05)[0]
+                            indices_low = np.where(data[0] < -3.05)[0]
+                            # 100 이상 차이나는 지점 찾기
+                            idx_diff_low = np.where(np.diff(indices_low) > 100)[0]
+
+                            if len(idx_diff_low) > 0 and len(indices_high) > 0:
+                                # 삭제할 구간 설정
+                                start_1 = indices_high[0]  # 시작 구간 1
+                                end_1 = indices_low[idx_diff_low[0]]  # 끝 구간 1
+                                start_2 = indices_low[idx_diff_low[0] + 1]  # 시작 구간 2
+                                end_2 = indices_high[-1]  # 끝 구간 2
+
+                                # start_1 ~ end_2 구간에 6.1을 더하기
+                                data[0][start_1:end_2 + 1] += 6.1  # 해당 구간에 6.1 추가
+
+                                # 필터링을 위한 마스크 생성
+                                indices_all = np.arange(len(data[0]))  # 전체 인덱스 생성
+                                mask = ~((indices_all >= start_1) & (indices_all <= end_1) | (indices_all >= start_2) & (indices_all <= end_2))
+
+                                # 특정 구간 제거
+                                x_data = data[0][mask]
+                                nor_x = x_data - data[0][0]
+                                label_array = label_array[mask]
+                                
+                                print(f"After 0600 processing: data length {len(x_data)}, label length {len(label_array)}")
+                        except Exception as e:
+                            print(f"⚠️ 예외 발생 (ind: {ind}, i: {i}) - {e}")
+                            pass  # 예외가 발생해도 무시하고 계속 진행
+                    
+                    # 🔍 길이 체크
+                    if len(nor_x) == 0:
+                        print(f"⚠️ Empty data after processing {ind}_{i}")
+                        continue
+                    
+                    # 🔍 레이블 체크
+                    if np.all(label_array == 0):
+                        print(f"⚠️ All zero labels for {ind}_{i}")
+                        # 최소한의 레이블 생성
+                        mid_point = len(label_array) // 2
+                        label_array[mid_point-10:mid_point+10] = 0.1
+                    
+                    # 스무딩 적용
+                    label_tensor = torch.tensor(label_array, dtype=torch.float32).unsqueeze(0).unsqueeze(0)
+                    smoothed_signal = smooth_label_signal(label_tensor, kernel_size=10001, sigma=500.0)
+                    smoothed_signal = smoothed_signal.squeeze(0).squeeze(0)
+                    
+                    print(f"After smoothing: min={smoothed_signal.min():.6f}, max={smoothed_signal.max():.6f}")
+                    
+                    # 🔧 안전한 정규화
+                    max_val = smoothed_signal.max()
+                    if max_val > 1e-6:  # 매우 작은 값이 아닌 경우만 정규화
+                        smoothed_signal = smoothed_signal / max_val
+                    else:
+                        print(f"⚠️ Max value too small ({max_val:.2e}), skipping normalization")
+                        smoothed_signal = torch.ones_like(smoothed_signal) * 0.01
+                    
+                    print(f"After normalization: min={smoothed_signal.min():.6f}, max={smoothed_signal.max():.6f}")
+                    
+                    # 랜덤 값 대체
+                    smoothed_signal = replace_zeros_with_random_torch(smoothed_signal, low=0.01, high=0.1)
+                    
+                    print(f"After random replace: min={smoothed_signal.min():.6f}, max={smoothed_signal.max():.6f}")
+                    
+                    # 🔧 최종 안전성 체크 및 클리핑
+                    if torch.isnan(smoothed_signal).any():
+                        print("⚠️ NaN detected in smoothed_signal!")
+                        continue
+                    if torch.isinf(smoothed_signal).any():
+                        print("⚠️ Inf detected in smoothed_signal!")
+                        continue
+                    
+                    # BCE 범위로 클리핑
+                    smoothed_signal = torch.clamp(smoothed_signal, 0.0, 1.0)
+                    print(f"After clipping: min={smoothed_signal.min():.6f}, max={smoothed_signal.max():.6f}")
+                    
+                    # 시퀀스 생성
+                    valid_count = 0
+                    for j in range(seq_len, len(nor_x) - seq_len):
+                        x_win = nor_x[j - seq_len : j]
+                        
+                        # 🔍 입력 데이터 유효성 체크
+                        if np.isnan(x_win).any() or np.isinf(x_win).any():
+                            continue
+                        
+                        y_win = smoothed_signal[j]
+                        
+                        # 🔍 레이블 유효성 체크  
+                        if torch.isnan(y_win) or torch.isinf(y_win):
+                            continue
+                        
+                        x_seq.append(torch.tensor(x_win, dtype=torch.float32))
+                        y_seq.append(torch.tensor(y_win.item(), dtype=torch.float32))  # .item()으로 스칼라 변환
+                        valid_count += 1
+                    
+                    print(f'{ind}_{i} file processed. Data length: {len(nor_x)}, Valid sequences: {valid_count}')
+                    
+            except Exception as e:
+                print(f"⚠️ Error processing {ind}_{i}: {e}")
+                continue
+    
+    print(f'Total sequences: {len(x_seq)}')
+    return x_seq, y_seq
+
+class train_bin_dataset(Dataset):
+    def __init__(self, file_dir, seq_len):
+        self.needle_dis = ['0600','0800', '1000']
+        self.seq_len = seq_len
+        self.x_seq = []
+        self.y_seq = []
+        self.range_list = [i for i in range(1, 19)]
+        self.file_dir = file_dir
+        
+        self.x_seq, self.y_seq = Data_preprocessing(self.needle_dis, self.seq_len, file_dir, self.range_list)
+        
+    def __len__(self):
+        return len(self.y_seq)
+    
+    def __getitem__(self, idx):
+        return self.x_seq[idx], self.y_seq[idx]               
+    
+class val_bin_dataset(Dataset):
+    def __init__(self, file_dir, seq_len):
+        self.needle_dis = ['0600', '0800', '1000']
+        self.seq_len = seq_len
+        self.x_seq = []
+        self.y_seq = []
+        self.range_list = [i for i in range(18, 21)]
+        self.file_dir = file_dir
+        
+        self.x_seq, self.y_seq = Data_preprocessing(self.needle_dis, self.seq_len, file_dir, self.range_list)
+        
+    def __len__(self):
+        return len(self.y_seq)
+    
+    def __getitem__(self, idx):
+        return self.x_seq[idx], self.y_seq[idx]
+
+file_dir = ""
+seq_len = 512
+batch_size = 512
+
+train_ds = train_bin_dataset(file_dir, seq_len)
+val_ds = val_bin_dataset(file_dir, seq_len)
+
+print('train_ds_len', len(train_ds))
+print('val_ds_len', len(val_ds))
+
+# 이진화: 0.5를 임계값으로 사용 (필요에 따라 조정)
+binary_labels = [1 if y.item() > 0.8 else 0 for _, y in train_ds]
+class_counts = [binary_labels.count(0), binary_labels.count(1)]
+class_weights = [1.0 / class_counts[0], 1.0 / class_counts[1]]  # 반비례 가중치
+
+# 샘플 가중치 설정: 이진화한 레이블을 기준으로 가중치 부여
+weights = [class_weights[label] for label in binary_labels]
+sampler = WeightedRandomSampler(weights, num_samples=len(weights), replacement=True)
+
+# 데이터로더에 샘플러 추가
+train_dl = DataLoader(train_ds, batch_size=batch_size, sampler=sampler, shuffle=False, drop_last=True)
+val_dl = DataLoader(val_ds, batch_size=batch_size, shuffle=False, drop_last=True)
+
+print('train_dl_len', len(train_dl))
+print('val_dl_len', len(val_dl))
+
+# LSTM 모델
+class LSTMAnomalyDetector(nn.Module):
+    def __init__(self, input_size, hidden_size, num_layers, output_size):
+        super(LSTMAnomalyDetector, self).__init__()
+        self.input_size = input_size
+        self.output_size = output_size
+        self.hidden_size = hidden_size
+        self.num_layers = num_layers
+        self.lstm = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True)
+        self.fc1 = nn.Linear(hidden_size, 512)
+        self.fc2 = nn.Linear(512, 256)
+        self.fc3 = nn.Linear(256, output_size)
+        self.dropout = nn.Dropout(0.2)
+
+    def forward(self, x):
+        lstm_out, _ = self.lstm(x)
+        lstm_out = lstm_out[:, -1, :]  # 마지막 타임스텝의 출력
+        fc1_out = F.relu(self.fc1(lstm_out))
+        fc1_out = self.dropout(fc1_out)
+        fc2_out = F.relu(self.fc2(fc1_out))
+        fc2_out = self.dropout(fc2_out)
+        return self.fc3(fc2_out)
+
+# ✅ train 함수 (중간 `val()` 실행 추가)
+def train(train_dl, val_dl, model, criterion, optimizer, epoch, eval_every=1000):
+    model.train()
+    epoch_loss = 0
+
+    for batch, (X, y) in enumerate(train_dl):
+        optimizer.zero_grad()
+        X, y = X.to(device).unsqueeze(-1), y.to(device).float().squeeze()
+        pred = model(X).squeeze()
+        loss = criterion(pred, y)  # 🎯 BCEWithLogitsLoss 사용
+        loss.backward()
+        optimizer.step()
+        
+        epoch_loss += loss.item()
+        
+        # 🎯 중간 평가 실행 (매 `eval_every` 배치마다 `val()` 실행)
+        if batch % eval_every == 0 and batch != 0:
+            val_loss, val_auc, val_preds, val_labels = val(val_dl, model, criterion)
+            print(f'🔹 Epoch {epoch+1} | Batch {batch}: Validation AUC = {val_auc:.5f} | Validation loos = {val_loss:.5f}')
+            model.train()
+    return epoch_loss / len(train_dl)
+
+# ✅ val 함수 (ROC-AUC 계산 추가)
+# val 함수 내에서 NaN 체크 추가
+def val(val_dl, model, criterion):
+    model.eval()
+    epoch_loss = 0
+    all_preds = []
+    all_labels = []
+    
+    with torch.no_grad():
+        for batch, (X, y) in enumerate(val_dl):
+            X, y = X.to(device).unsqueeze(-1), y.to(device).float()
+            pred = model(X).squeeze()
+            
+            # 🔍 NaN 체크 1: raw logits
+            if torch.isnan(pred).any():
+                print(f"⚠️ NaN detected in raw predictions at batch {batch}")
+                print(f"Input stats: min={X.min():.3f}, max={X.max():.3f}, mean={X.mean():.3f}")
+                continue
+            
+            loss = criterion(pred, y)
+            epoch_loss += loss.item()
+            probas = torch.sigmoid(pred)
+            
+            # 🔍 NaN 체크 2: sigmoid 후
+            if torch.isnan(probas).any():
+                print(f"⚠️ NaN detected in probabilities at batch {batch}")
+                print(f"Logits stats: min={pred.min():.3f}, max={pred.max():.3f}")
+                continue
+                
+            all_preds.extend(probas.cpu().numpy())
+            all_labels.extend(y.cpu().numpy())
+
+    # 🔍 NaN 체크 3: 최종 리스트
+    if len(all_preds) == 0:
+        print("⚠️ No valid predictions!")
+        return float('inf'), 0.0, [], []
+    
+    preds_array = np.array(all_preds)
+    labels_array = np.array(all_labels)
+    
+    print(f"Predictions - NaN count: {np.isnan(preds_array).sum()}")
+    print(f"Labels - NaN count: {np.isnan(labels_array).sum()}")
+    
+    if np.isnan(preds_array).any() or np.isnan(labels_array).any():
+        print("⚠️ NaN detected in final arrays!")
+        return float('inf'), 0.0, all_preds, all_labels
+    
+    avg_loss = epoch_loss / len(val_dl) if len(val_dl) > 0 else float('inf')
+    
+    # 이진화 및 AUC 계산
+    try:
+        binary_labels = [1 if label > 0.8 else 0 for label in all_labels]
+        if len(set(binary_labels)) > 1:  # 최소 2개 클래스가 있어야 AUC 계산 가능
+            auc_score = roc_auc_score(binary_labels, all_preds)
+        else:
+            print("⚠️ Only one class in labels, cannot compute AUC")
+            auc_score = 0.0
+    except Exception as e:
+        print(f"⚠️ Error computing AUC: {e}")
+        auc_score = 0.0
+    
+    return avg_loss, auc_score, all_preds, all_labels
+
+# ✅ 모델 설정 옵티마이저 & 손실 함수
+model = LSTMAnomalyDetector(input_size=1, hidden_size=512, num_layers=2, output_size=1)
+model = nn.DataParallel(model).to(device)
+
+optimizer = optim.Adam(model.parameters(), lr=0.00001)
+criterion = nn.BCEWithLogitsLoss()
+
+# ✅ 조기 종료(Early Stopping) 설정
+patience = 5         # 개선되지 않는 Epoch 수 (조기 종료 기준)
+best_val_loss = float('inf')  # 현재까지 가장 낮은 Validation Loss
+early_stop_counter = 0        # 개선되지 않은 Epoch 수 카운트
+min_delta = 0.0002            # Loss 개선 최소 기준 (너무 미세한 차이는 무시)
+
+
+# ✅ 학습 실행 (조기 종료 포함)
+num_epochs = 100
+train_losses = []
+val_losses = []
+val_aucs = []
+
+# validation 결과를 저장하기 위한 리스트 (시각화를 위해)
+val_losses_history = []
+val_aucs_history = []
+val_preds_history = []   # 각 epoch별 전체 예측값
+val_labels_history = []  # 각 epoch별 전체 정답
+
+for epoch in range(num_epochs):
+    print(f"\n🚀 Epoch {epoch+1}/{num_epochs}\n--------------------------------------------------------")
+    model.train()
+    epoch_loss = 0
+
+    for batch, (X, y) in enumerate(train_dl):
+        optimizer.zero_grad()
+        X, y = X.to(device).unsqueeze(-1), y.to(device).float().squeeze()
+        pred = model(X).squeeze()
+        loss = criterion(pred, y)  # 🎯 BCEWithLogitsLoss 사용
+        loss.backward()
+        optimizer.step()
+
+        epoch_loss += loss.item()
+        train_loss = epoch_loss / len(train_dl)
+    print("train loss: ", train_loss)
+    
+    model.eval()
+    val_epoch_loss = 0
+    # all_x_data = []
+    all_preds = []
+    # all_val_preds = []
+    all_labels = []
+    
+    
+    with torch.no_grad():
+        for batch, (X, y) in enumerate(val_dl):
+            X, val_labels = X.to(device).unsqueeze(-1), y.to(device).float()
+            val_preds = model(X).squeeze()  # raw logits
+            loss = criterion(val_preds, val_labels)
+            val_epoch_loss += loss.item()
+            probas = torch.sigmoid(val_preds)  # 확률값으로 변환
+            X_data = X.cpu().numpy()
+            # all_val_preds.extend(val_preds.cpu().numpy())
+            # all_x_data.extend(X_data[-1])
+            all_preds.extend(probas.cpu().numpy())
+            all_labels.extend(y.cpu().numpy())
+
+    val_loss = val_epoch_loss / len(val_dl)
+    binary_labels = [1 if label > 0.8 else 0 for label in all_labels]
+    val_auc = roc_auc_score(binary_labels, all_preds)
+    
+    print(f'🔹 Validation Loss: {val_loss:.10f}, ROC-AUC Score: {val_auc:.5f}')
+    
+    train_losses.append(train_loss)
+    val_losses.append(val_loss)
+    val_aucs.append(val_auc)
+    
+    # validation 결과 저장 (시각화 용)
+    val_losses_history.append(val_loss)
+    val_aucs_history.append(val_auc)
+    val_preds_history.append(val_preds)
+    val_labels_history.append(val_labels)
+ 
+    # 🎯 조기 종료 체크: val_loss 기준
+    if val_loss < (best_val_loss - min_delta):
+        best_val_loss = val_loss
+        early_stop_counter = 0
+        torch.save(model.state_dict(), "./model/best_model.pth")  # 🎯 모델 저장
+        print(f"✅ Model saved! New best val_loss: {best_val_loss:.5f}")
+    else:
+        early_stop_counter += 1
+        print(f"⚠️ Early stopping counter: {early_stop_counter}/{patience}")
+
+    if early_stop_counter >= patience:
+        print("⏹ Early stopping activated. Stopping training.")
+        break  # 🎯 학습 중단
+
+print('🎯 Training Completed! Best Validation Loss:', best_val_loss)
+
+fig = plt.figure(num=1, figsize=(16, 8))
+plt.plot(all_x_data, linewidth=1.5, color='b', label='X_data')
+plt.plot(all_labels, linewidth=1.5, color='g', label='True prabability')
+plt.plot(all_preds, linewidth=1.5, color='r', label='Predicted prabability')
+plt.xlabel("Value")
+plt.ylabel("Force")
+plt.legend()
+# plt.plot(all_val_preds, linewidth=1.5, color='y')
