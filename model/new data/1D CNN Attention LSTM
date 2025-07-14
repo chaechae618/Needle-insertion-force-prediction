@@ -1,0 +1,381 @@
+import os
+import numpy as np
+import torch
+from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
+import torch.nn as nn
+import torch.optim as optim
+from sklearn.metrics import roc_auc_score, precision_recall_curve, average_precision_score
+import matplotlib.pyplot as plt
+from scipy.ndimage import gaussian_filter1d
+from scipy.signal import find_peaks
+import torch.nn.functional as F
+
+# ✅ 디바이스 설정
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+# ✅ 더 정밀한 Asymmetric Gaussian smoothing (더 좁은 범위)
+def smooth_label_signal(x, left_sigma=150.0, right_sigma=50.0, kernel_size=601):
+    """더 좁은 범위의 스무딩으로 정확한 시점 표현"""
+    half = kernel_size // 2
+    t = torch.linspace(-1, 1, steps=kernel_size, device=x.device)
+    left_mask = t < 0
+    right_mask = ~left_mask
+    left = torch.exp(-0.5 * (t[left_mask]**2) / (left_sigma**2))
+    right = torch.exp(-0.5 * (t[right_mask]**2) / (right_sigma**2))
+    gauss = torch.cat([left, right])
+    gauss /= gauss.sum()
+    gauss = gauss.view(1, 1, -1)
+
+    x = x.float().unsqueeze(0).unsqueeze(0)  # [1,1,T]
+    x_padded = F.pad(x, (half, half), mode='reflect')
+    return F.conv1d(x_padded, gauss).squeeze()
+
+# ✅ 개선된 데이터 전처리 (더 정밀한 라벨링)
+def Data_preprocessing(needle_dis, seq_len, file_dir, range_list):
+    x_seq, y_seq, time_seq = [], [], []
+    for ind in needle_dis:
+        for i in range(range_list[0], range_list[1] + 1):
+            fp = os.path.join(file_dir, f'T2D_{ind}/SavedData_{i:03d}.bin')
+            try:
+                data = np.fromfile(fp, dtype=np.float32).reshape(-1,5).T.copy()
+                force = data[0]
+                norm_force = force - force[0]
+                raw_lbl = data[4]
+                idxs = np.where(raw_lbl==1)[0]
+                if len(idxs)<2: continue
+                second = idxs[1]  # 실제 puncture 시점
+                
+                # 더 정밀한 라벨 생성 (좁은 범위)
+                lbl_arr = np.zeros_like(raw_lbl, dtype=np.float32)
+                lbl_arr[second] = 1.0
+                sm = smooth_label_signal(torch.from_numpy(lbl_arr), 
+                                       left_sigma=150.0, right_sigma=50.0, 
+                                       kernel_size=601).numpy()
+                sm /= sm.max()
+                
+                # 시퀀스 생성 (더 많은 샘플 생성)
+                for j in range(0, len(norm_force)-seq_len, seq_len//4):  # 오버랩 증가
+                    x_seq.append(torch.tensor(norm_force[j:j+seq_len], dtype=torch.float32))
+                    center_idx = j + seq_len//2
+                    y_seq.append(torch.tensor(sm[center_idx], dtype=torch.float32))
+                    time_seq.append(center_idx)
+                    
+            except Exception as e:
+                print(f"⚠️ Error loading {fp}: {e}")
+    return x_seq, y_seq, time_seq
+
+# ✅ 개선된 Dataset 클래스
+class bin_dataset(Dataset):
+    def __init__(self, file_dir, seq_len, mode='train'):
+        self.needle_dis = ['0800','1000']
+        self.seq_len = seq_len
+        self.file_dir = file_dir
+        self.range_list = (1,17) if mode=='train' else (18,20)
+        self.x_seq, self.y_seq, self.time_seq = Data_preprocessing(self.needle_dis, self.seq_len, self.file_dir, self.range_list)
+        
+        # 데이터 분포 확인
+        high_labels = sum(1 for y in self.y_seq if y.item() > 0.5)
+        print(f"Dataset {mode}: Total={len(self.y_seq)}, High_labels={high_labels}")
+        
+    def __len__(self): return len(self.y_seq)
+    def __getitem__(self, idx): 
+        return self.x_seq[idx], self.y_seq[idx], self.time_seq[idx]
+
+# ✅ 더 정밀한 모델 정의 (Transformer + CNN 결합)
+class PrecisePunctureDetector(nn.Module):
+    def __init__(self, input_size, hidden_size, num_layers, output_size):
+        super().__init__()
+        
+        # 1D CNN for local pattern detection
+        self.conv1 = nn.Conv1d(input_size, 64, kernel_size=7, padding=3)
+        self.conv2 = nn.Conv1d(64, 128, kernel_size=5, padding=2)
+        self.conv3 = nn.Conv1d(128, 256, kernel_size=3, padding=1)
+        self.pool = nn.AdaptiveAvgPool1d(1)
+        
+        # LSTM for sequence modeling
+        self.lstm = nn.LSTM(256, hidden_size, num_layers, batch_first=True, dropout=0.3)
+        
+        # Multi-head attention for precise timing
+        self.attention = nn.MultiheadAttention(hidden_size, num_heads=16, batch_first=True, dropout=0.2)
+        
+        # Time-position encoding
+        self.time_embedding = nn.Linear(1, hidden_size // 2)
+        
+        # Gradient flow enhancement
+        self.gradient_reversal_layer = nn.Linear(hidden_size, hidden_size)
+        
+        # 정밀한 분류를 위한 다층 네트워크
+        self.classifier = nn.Sequential(
+            nn.Linear(hidden_size + hidden_size // 2, 1024),
+            nn.ReLU(),
+            nn.Dropout(0.4),
+            nn.Linear(1024, 512),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(512, 256),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(256, 128),
+            nn.ReLU(),
+            nn.Linear(128, output_size)
+        )
+        
+    def forward(self, x, time_step=None):
+        batch_size = x.size(0)
+        
+        # CNN feature extraction
+        x_conv = x.transpose(1, 2)  # [B, 1, T] -> [B, T, 1] -> [B, 1, T]
+        x_conv = torch.relu(self.conv1(x_conv))
+        x_conv = torch.relu(self.conv2(x_conv))
+        x_conv = torch.relu(self.conv3(x_conv))
+        
+        # Global average pooling
+        x_pooled = self.pool(x_conv).squeeze(-1)  # [B, 256]
+        x_pooled = x_pooled.unsqueeze(1)  # [B, 1, 256]
+        
+        # LSTM processing
+        lstm_out, (h_n, c_n) = self.lstm(x_pooled)
+        
+        # Self-attention for precise timing
+        attn_out, attn_weights = self.attention(lstm_out, lstm_out, lstm_out)
+        
+        # Use last hidden state
+        h_last = attn_out[:, -1, :]  # [B, hidden_size]
+        
+        # Time embedding
+        if time_step is not None:
+            time_norm = (time_step.float() / 15000.0).unsqueeze(-1)  # Normalize time
+            time_emb = torch.relu(self.time_embedding(time_norm))
+            h_combined = torch.cat([h_last, time_emb], dim=1)
+        else:
+            h_combined = h_last
+        
+        # Final prediction
+        output = self.classifier(h_combined)
+        return output
+
+# ✅ 정밀도 향상을 위한 손실 함수
+class PrecisionFocusedLoss(nn.Module):
+    def __init__(self, alpha=0.25, gamma=2.0, precision_weight=3.0):
+        super().__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.precision_weight = precision_weight
+        self.bce = nn.BCEWithLogitsLoss()
+        
+    def forward(self, pred, target, time_step=None):
+        # Focal Loss for imbalanced data
+        bce_loss = self.bce(pred, target)
+        pt = torch.exp(-bce_loss)
+        focal_loss = self.alpha * (1-pt)**self.gamma * bce_loss
+        
+        # Precision enhancement: 높은 예측값에 대한 정확도 강화
+        pred_prob = torch.sigmoid(pred)
+        high_pred_mask = pred_prob > 0.7
+        
+        if high_pred_mask.any():
+            # 높은 예측값이 실제 높은 타겟과 일치하는지 확인
+            precision_loss = F.mse_loss(pred_prob[high_pred_mask], target[high_pred_mask])
+            focal_loss += self.precision_weight * precision_loss
+        
+        # 시간 기반 페널티 (초기에 높은 예측 억제)
+        if time_step is not None:
+            early_mask = time_step < 8000
+            early_fp_mask = early_mask & (pred_prob > 0.5) & (target < 0.1)
+            if early_fp_mask.any():
+                early_penalty = 2.0 * self.bce(pred[early_fp_mask], target[early_fp_mask])
+                focal_loss += early_penalty
+        
+        return focal_loss
+
+# ✅ 모델 성능 평가 함수
+def evaluate_model(model, dataloader, device):
+    model.eval()
+    all_preds, all_labels, all_times = [], [], []
+    
+    with torch.no_grad():
+        for X, y, time_step in dataloader:
+            X, y, time_step = X.unsqueeze(-1).to(device), y.to(device), time_step.to(device)
+            pred = model(X, time_step).squeeze()
+            pred_prob = torch.sigmoid(pred)
+            
+            all_preds.extend(pred_prob.cpu().numpy())
+            all_labels.extend(y.cpu().numpy())
+            all_times.extend(time_step.cpu().numpy())
+    
+    # 후처리: 가우시안 스무딩으로 노이즈 제거
+    smoothed_preds = gaussian_filter1d(np.array(all_preds), sigma=5)
+    
+    # 이진 분류 성능
+    binary_labels = [1 if l > 0.5 else 0 for l in all_labels]
+    auc_score = roc_auc_score(binary_labels, smoothed_preds)
+    ap_score = average_precision_score(binary_labels, smoothed_preds)
+    
+    return {
+        'auc': auc_score,
+        'ap': ap_score,
+        'predictions': smoothed_preds,
+        'labels': all_labels,
+        'times': all_times
+    }
+
+# ✅ 정밀한 피크 검출 함수
+def find_precise_peaks(predictions, times, height_threshold=0.5, distance=100):
+    """정밀한 puncture 시점 검출"""
+    peaks, properties = find_peaks(predictions, 
+                                  height=height_threshold, 
+                                  distance=distance,
+                                  prominence=0.2)
+    
+    peak_times = [times[i] for i in peaks]
+    peak_heights = [predictions[i] for i in peaks]
+    
+    return peak_times, peak_heights
+
+# ✅ 메인 학습 코드
+def main():
+    # 하이퍼파라미터
+    file_dir = '/home/ibom002/dataset/Data_20250709'
+    seq_len = 1024  # 더 긴 시퀀스로 증가
+    batch_size = 64  # 배치 크기 감소로 정밀도 향상
+    num_epochs = 100
+    
+    # 데이터 로드
+    print("📊 Loading datasets...")
+    train_ds = bin_dataset(file_dir, seq_len, mode='train')
+    val_ds = bin_dataset(file_dir, seq_len, mode='val')
+    
+    # 가중치 샘플링 (더 정밀한 균형)
+    labels = [1 if y.item() > 0.5 else 0 for _, y, _ in train_ds]
+    pos_weight = labels.count(0) / max(labels.count(1), 1)
+    print(f"Positive weight: {pos_weight:.2f}")
+    
+    # 샘플러 설정
+    weights = [pos_weight if l == 1 else 1.0 for l in labels]
+    sampler = WeightedRandomSampler(weights, len(weights), replacement=True)
+    
+    train_dl = DataLoader(train_ds, batch_size=batch_size, sampler=sampler, drop_last=True)
+    val_dl = DataLoader(val_ds, batch_size=batch_size, shuffle=False, drop_last=True)
+    
+    # 모델 및 옵티마이저
+    print("🏗️ Building model...")
+    model = PrecisePunctureDetector(1, 512, 3, 1).to(device)
+    
+    # 기존 모델 로드 (있는 경우)
+    if os.path.exists('./model/best_model.pth'):
+        print("📁 Loading existing model...")
+        model.load_state_dict(torch.load('./model/best_model.pth', map_location=device))
+    
+    optimizer = optim.AdamW(model.parameters(), lr=5e-6, weight_decay=1e-3)
+    scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=10, T_mult=2)
+    criterion = PrecisionFocusedLoss(alpha=0.25, gamma=2.0, precision_weight=5.0)
+    
+    # Early stopping
+    best_metric = 0.0
+    patience = 20
+    min_delta = 0.001
+    early_stop_counter = 0
+    
+    print("🚀 Starting training...")
+    for epoch in range(1, num_epochs + 1):
+        print(f"\n🔄 Epoch {epoch}/{num_epochs}")
+        
+        # Training
+        model.train()
+        train_loss = 0
+        for batch_idx, (X, y, time_step) in enumerate(train_dl):
+            X, y, time_step = X.unsqueeze(-1).to(device), y.to(device), time_step.to(device)
+            
+            optimizer.zero_grad()
+            pred = model(X, time_step).squeeze()
+            loss = criterion(pred, y, time_step)
+            loss.backward()
+            
+            # Gradient clipping
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+            
+            train_loss += loss.item()
+            
+            if batch_idx % 50 == 0:
+                print(f"  Batch {batch_idx}/{len(train_dl)}, Loss: {loss.item():.6f}")
+        
+        scheduler.step()
+        train_loss /= len(train_dl)
+        
+        # Validation
+        results = evaluate_model(model, val_dl, device)
+        
+        print(f"  Train Loss: {train_loss:.6f}")
+        print(f"  Val AUC: {results['auc']:.5f}, Val AP: {results['ap']:.5f}")
+        
+        # Peak detection analysis
+        peak_times, peak_heights = find_precise_peaks(results['predictions'], 
+                                                     results['times'])
+        if peak_times:
+            print(f"  🎯 Detected peaks at times: {peak_times}")
+            print(f"  📊 Peak heights: {[f'{h:.3f}' for h in peak_heights]}")
+        
+        # Early stopping
+        current_metric = results['ap']  # Average Precision 사용
+        if current_metric > best_metric + min_delta:
+            best_metric = current_metric
+            early_stop_counter = 0
+            
+            # 모델 저장
+            os.makedirs('./model', exist_ok=True)
+            torch.save(model.state_dict(), './model/best_precise_model.pth')
+            print(f"  ✅ New best AP: {current_metric:.5f}, model saved!")
+        else:
+            early_stop_counter += 1
+            print(f"  ⚠️ No improvement ({early_stop_counter}/{patience})")
+            if early_stop_counter >= patience:
+                print("  ⏹️ Early stopping triggered.")
+                break
+    
+    print(f"\n🎯 Training finished! Best AP: {best_metric:.5f}")
+    
+    # 최종 평가
+    print("\n📈 Final evaluation...")
+    model.load_state_dict(torch.load('./model/best_precise_model.pth', map_location=device))
+    final_results = evaluate_model(model, val_dl, device)
+    
+    peak_times, peak_heights = find_precise_peaks(final_results['predictions'], 
+                                                 final_results['times'])
+    
+    print(f"Final AUC: {final_results['auc']:.5f}")
+    print(f"Final AP: {final_results['ap']:.5f}")
+    print(f"Predicted puncture times: {peak_times}")
+    print(f"Prediction confidence: {[f'{h:.3f}' for h in peak_heights]}")
+    
+    return model, final_results
+
+# ✅ 시각화 함수
+def visualize_predictions(model, val_ds, device, sample_idx=10):
+    """특정 샘플의 예측 결과 시각화"""
+    model.eval()
+    
+    # 전체 시퀀스 데이터 로드
+    sample_data = val_ds[sample_idx]
+    
+    with torch.no_grad():
+        X, y, time_step = sample_data
+        X = X.unsqueeze(0).unsqueeze(-1).to(device)
+        time_step = torch.tensor([time_step]).to(device)
+        
+        pred = model(X, time_step).squeeze()
+        pred_prob = torch.sigmoid(pred).cpu().numpy()
+        
+        print(f"Sample {sample_idx}:")
+        print(f"  Time: {time_step.item()}")
+        print(f"  True label: {y.item():.3f}")
+        print(f"  Prediction: {pred_prob:.3f}")
+        print(f"  Raw prediction: {pred.cpu().numpy():.3f}")
+
+if __name__ == "__main__":
+    model, results = main()
+    
+    # 샘플 시각화
+    file_dir = '/home/ibom002/dataset/Data_20250709'
+    val_ds = bin_dataset(file_dir, 1024, mode='val')
+    visualize_predictions(model, val_ds, device, sample_idx=10)
