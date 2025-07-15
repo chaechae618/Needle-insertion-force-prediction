@@ -1,404 +1,703 @@
 import os
 import numpy as np
-import matplotlib.pyplot as plt
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from torch.utils.data import DataLoader, Dataset
+from sklearn.metrics import roc_auc_score, precision_recall_curve, auc
+import matplotlib.pyplot as plt
 import torch.nn.functional as F
-from sklearn.metrics import roc_auc_score
-from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
-from scipy.signal import find_peaks
 
-# GPU 설정
-os.environ["CUDA_DEVICE_ORDER"]="PCI_BUS_ID"
-os.environ["CUDA_VISIBLE_DEVICES"]= "0,1,2"
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print('Device:', device)
+# 🔧 GPU 3개 설정 추가
+os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+os.environ["CUDA_VISIBLE_DEVICES"] = "0,1,2"  # GPU 0, 1, 2 사용
 torch.cuda.manual_seed_all(42)
 
-def gaussian_kernel1d(kernel_size, sigma):
-    x = torch.arange(kernel_size, dtype=torch.float32) - (kernel_size - 1) / 2.0
-    kernel = torch.exp(-0.5 * (x / sigma) ** 2)
-    kernel = kernel / kernel.sum()
-    return kernel
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print('Device:', device)
+print('Current cuda device:', torch.cuda.current_device())
+print('Count of using GPUs:', torch.cuda.device_count())
 
-def smooth_label_signal(signal, kernel_size=51, sigma=5.0):
-    """적절한 스무딩 (과도하지 않게) - 개선: 51, 5.0으로 축소"""
-    kernel = gaussian_kernel1d(kernel_size, sigma).to(signal.device)
-    kernel = kernel.view(1, 1, kernel_size)
-    padding = kernel_size // 2
-    smoothed_signal = F.conv1d(signal, kernel, padding=padding)
-    return smoothed_signal
+# 🔧 필요한 보조 클래스들 구현
 
-def create_precise_label(data, puncture_indices, total_length, peak_width=30):
-    """정확한 라벨 생성 - sharp peak 생성"""
-    label_array = np.zeros(total_length, dtype=np.float32)
+class PeakAwareAugmentation:
+    def __init__(self, noise_std=0.02, amplitude_range=(0.9, 1.1)):
+        self.noise_std = noise_std
+        self.amplitude_range = amplitude_range
     
-    if len(puncture_indices) >= 2:
-        # 두 번째 puncture만 사용
-        center = puncture_indices[1]
+    def add_realistic_noise(self, data, peak_indices):
+        """실제 센서 노이즈 시뮬레이션"""
+        noise = np.random.normal(0, self.noise_std, data.shape)
+        return data + noise
+    
+    def amplitude_scaling(self, data, scale_factor=None):
+        """진폭 스케일링"""
+        if scale_factor is None:
+            scale_factor = np.random.uniform(*self.amplitude_range)
+        baseline = np.percentile(data, 10)
+        scaled_data = baseline + (data - baseline) * scale_factor
+        return scaled_data
+
+class SmartBatchSampler:
+    """Peak 중심의 지능적 배치 샘플링"""
+    
+    def __init__(self, dataset, batch_size, peak_ratio=0.3):
+        self.dataset = dataset
+        self.batch_size = batch_size
+        self.peak_ratio = peak_ratio
         
-        # Gaussian-like peak 생성 (더 sharp하게)
-        for i in range(max(0, center - peak_width), min(total_length, center + peak_width)):
-            distance = abs(i - center)
-            # 더 sharp한 Gaussian
-            intensity = np.exp(-0.5 * (distance / (peak_width/4)) ** 2)
-            label_array[i] = intensity
+        # Peak/Non-peak 샘플 구분
+        self.peak_indices = []
+        self.normal_indices = []
+        
+        for i, (_, label) in enumerate(dataset):
+            if torch.max(label) > 0.7:  # Peak 샘플
+                self.peak_indices.append(i)
+            else:  # Normal 샘플
+                self.normal_indices.append(i)
+        
+        print(f"📊 Smart Sampler: {len(self.peak_indices)} peak samples, {len(self.normal_indices)} normal samples")
+    
+    def __iter__(self):
+        # 배치별로 Peak/Normal 비율 조정
+        peak_per_batch = int(self.batch_size * self.peak_ratio)
+        normal_per_batch = self.batch_size - peak_per_batch
+        
+        # 인덱스 셔플
+        np.random.shuffle(self.peak_indices)
+        np.random.shuffle(self.normal_indices)
+        
+        peak_idx = 0
+        normal_idx = 0
+        
+        while peak_idx < len(self.peak_indices) or normal_idx < len(self.normal_indices):
+            batch_indices = []
             
-    return label_array
-
-def Data_preprocessing(needle_dis, seq_len, file_dir, range_list):
-    x_seq = []
-    y_seq = []
+            # Peak 샘플 추가
+            for _ in range(peak_per_batch):
+                if peak_idx < len(self.peak_indices):
+                    batch_indices.append(self.peak_indices[peak_idx])
+                    peak_idx += 1
+            
+            # Normal 샘플 추가
+            for _ in range(normal_per_batch):
+                if normal_idx < len(self.normal_indices):
+                    batch_indices.append(self.normal_indices[normal_idx])
+                    normal_idx += 1
+            
+            if len(batch_indices) > 0:
+                np.random.shuffle(batch_indices)  # 배치 내 셔플
+                yield batch_indices
     
-    for ind in needle_dis:
-        for i in range_list:
-            try:
-                file_path = os.path.join(file_dir, f'T2D_{ind}/SavedData_{i:03d}.bin')
-                with open(file_path, 'rb') as file1:
-                    data = np.frombuffer(file1.read(), dtype=np.float32).reshape(-1, 5).T.copy()
-                    nor_x = data[0] - data[0][0]
-                    
-                    # NaN/Inf 체크
-                    if np.isnan(nor_x).any() or np.isinf(nor_x).any():
-                        continue
-                        
-                    indices = np.where(data[4] == 1)[0]
-                    if len(indices) < 2:
-                        continue
-                    
-                    # 🔥 정확한 라벨 생성 (sharp peak)
-                    label_array = create_precise_label(data, indices, len(data[4]), peak_width=30)
-                    
-                    # 0600 데이터 특별 처리
-                    if ind == '0600':
-                        try:
-                            indices_high = np.where(data[0] > 3.05)[0]
-                            indices_low = np.where(data[0] < -3.05)[0]
-                            idx_diff_low = np.where(np.diff(indices_low) > 100)[0]
+    def __len__(self):
+        total_samples = len(self.peak_indices) + len(self.normal_indices)
+        return (total_samples + self.batch_size - 1) // self.batch_size
 
-                            if len(idx_diff_low) > 0 and len(indices_high) > 0:
-                                start_1 = indices_high[0]
-                                end_1 = indices_low[idx_diff_low[0]]
-                                start_2 = indices_low[idx_diff_low[0] + 1]
-                                end_2 = indices_high[-1]
-
-                                data[0][start_1:end_2 + 1] += 6.1
-                                indices_all = np.arange(len(data[0]))
-                                mask = ~((indices_all >= start_1) & (indices_all <= end_1) | (indices_all >= start_2) & (indices_all <= end_2))
-
-                                nor_x = data[0][mask] - data[0][0]
-                                label_array = label_array[mask]
-                        except:
-                            pass
-                    
-                    if len(nor_x) == 0 or np.all(label_array == 0):
-                        continue
-                    
-                    # 🔥 가벼운 스무딩만 적용 (peak 보존) - 개선: 51, 5.0 사용
-                    label_tensor = torch.tensor(label_array, dtype=torch.float32).unsqueeze(0).unsqueeze(0)
-                    smoothed_signal = smooth_label_signal(label_tensor, kernel_size=51, sigma=5.0)
-                    smoothed_signal = smoothed_signal.squeeze()
-                    
-                    # 정규화 (peak를 1.0으로)
-                    max_val = smoothed_signal.max()
-                    if max_val > 1e-6:
-                        smoothed_signal = smoothed_signal / max_val
-                    else:
-                        continue
-                    
-                    # 안전성 체크
-                    if torch.isnan(smoothed_signal).any() or torch.isinf(smoothed_signal).any():
-                        continue
-                    
-                    smoothed_signal = torch.clamp(smoothed_signal, 0.0, 1.0)
-                    
-                    # 시퀀스 생성
-                    for j in range(seq_len, len(nor_x) - seq_len):
-                        x_win = nor_x[j - seq_len : j]
-                        
-                        if np.isnan(x_win).any() or np.isinf(x_win).any():
-                            continue
-                        
-                        y_win = smoothed_signal[j]
-                        
-                        if torch.isnan(y_win) or torch.isinf(y_win):
-                            continue
-                        
-                        x_seq.append(torch.tensor(x_win, dtype=torch.float32))
-                        y_seq.append(torch.tensor(y_win.item(), dtype=torch.float32))
-                    
-                    print(f'{ind}_{i} processed. Sequences: {len(x_seq)}')
-                    
-            except Exception as e:
-                print(f"Error processing {ind}_{i}: {e}")
-                continue
+# 🔧 Hybrid Loss 구현
+class HybridPeakDetectionLoss(nn.Module):
+    def __init__(self, 
+                 focal_alpha=0.99, 
+                 focal_gamma=2.0,
+                 dice_weight=0.3,
+                 peak_force_weight=2.0):
+        super().__init__()
+        self.focal_alpha = focal_alpha
+        self.focal_gamma = focal_gamma
+        self.dice_weight = dice_weight
+        self.peak_force_weight = peak_force_weight
+        
+    def focal_loss(self, pred_logits, target):
+        """Focal Loss: 불균형 데이터 해결"""
+        pred_probs = torch.sigmoid(pred_logits)
+        ce_loss = F.binary_cross_entropy_with_logits(pred_logits, target, reduction='none')
+        
+        # p_t 계산
+        p_t = pred_probs * target + (1 - pred_probs) * (1 - target)
+        
+        # Alpha weighting
+        alpha_t = self.focal_alpha * target + (1 - self.focal_alpha) * (1 - target)
+        
+        # Focal term
+        focal_term = (1 - p_t) ** self.focal_gamma
+        
+        focal_loss = alpha_t * focal_term * ce_loss
+        return focal_loss.mean()
     
-    print(f'Total sequences: {len(x_seq)}')
-    return x_seq, y_seq
-
-# 🔥 개선된 모델 아키텍처 - GELU, Attention, 적절한 Dropout
-class ImprovedLSTMDetector(nn.Module):
-    def __init__(self, input_size, hidden_size, num_layers, output_size):
-        super().__init__()
-        self.lstm = nn.LSTM(input_size, hidden_size, num_layers, 
-                           batch_first=True, dropout=0.1 if num_layers > 1 else 0)
+    def dice_loss(self, pred_logits, target):
+        """Dice Loss: 연속성과 형태 보존"""
+        pred_probs = torch.sigmoid(pred_logits)
         
-        # 🔥 Self-attention으로 peak 부분 강조 (처음부터 활성화)
-        self.attention = nn.MultiheadAttention(hidden_size, 8, batch_first=True)
-        self.norm1 = nn.LayerNorm(hidden_size)
+        # Smooth parameter to avoid division by zero
+        smooth = 1e-6
         
-        # 🔥 개선된 분류기 - GELU 사용, 드롭아웃 감소 (10%)
-        self.classifier = nn.Sequential(
-            nn.Linear(hidden_size, 256),
-            nn.GELU(),  # ReLU 대신 GELU 사용
-            nn.Dropout(0.1),  # 20% → 10%로 감소
-            nn.Linear(256, 64),
-            nn.GELU(),
-            nn.Linear(64, output_size)
-        )
-
-    def forward(self, x):
-        # LSTM 처리
-        lstm_out, _ = self.lstm(x)
+        # Flatten
+        pred_flat = pred_probs.view(-1)
+        target_flat = target.view(-1)
         
-        # Self-attention으로 중요한 부분 강조
-        attn_out, _ = self.attention(lstm_out, lstm_out, lstm_out)
-        attn_out = self.norm1(lstm_out + attn_out)
+        # Dice coefficient
+        intersection = (pred_flat * target_flat).sum()
+        dice_coeff = (2. * intersection + smooth) / (pred_flat.sum() + target_flat.sum() + smooth)
         
-        # 마지막 타임스텝 사용
-        final_out = attn_out[:, -1, :]
+        return 1 - dice_coeff
+    
+    def peak_forcing_loss(self, pred_logits, target):
+        """Peak Forcing: 1.0 달성을 위한 강제 학습"""
+        pred_probs = torch.sigmoid(pred_logits)
         
-        return self.classifier(final_out)
-
-# 🔥 Peak 영역에 가중치를 부여하는 커스텀 Loss
-class PeakAwareLoss(nn.Module):
-    def __init__(self, peak_weight=3.0, shape_weight=2.0):
-        super().__init__()
-        self.peak_weight = peak_weight
-        self.shape_weight = shape_weight
-        self.mse = nn.MSELoss(reduction='none')
-        self.bce = nn.BCEWithLogitsLoss(reduction='none')
+        # Peak 영역 식별 (0.9 이상)
+        peak_mask = target > 0.9
         
-    def forward(self, pred_logits, target):
-        pred_prob = torch.sigmoid(pred_logits.squeeze())
-        target = target.squeeze()
-        
-        # 기본 BCE Loss
-        bce_loss = self.bce(pred_logits.squeeze(), target)
-        
-        # MSE Loss (shape 정확도)
-        mse_loss = self.mse(pred_prob, target)
-        
-        # Peak 영역 가중치 (target > 0.7인 영역)
-        peak_mask = target > 0.7
         if peak_mask.any():
-            peak_bce = bce_loss[peak_mask].mean()
-            peak_mse = mse_loss[peak_mask].mean()
+            # Peak 영역에서 0.95 이상 강제 학습
+            peak_preds = pred_probs[peak_mask]
+            peak_targets = torch.ones_like(peak_preds) * 0.98  # 0.98 목표
+            
+            # MSE로 직접적 값 강제
+            peak_loss = F.mse_loss(peak_preds, peak_targets)
+            return peak_loss
         else:
-            peak_bce = torch.tensor(0.0, device=pred_logits.device)
-            peak_mse = torch.tensor(0.0, device=pred_logits.device)
-        
-        # 전체 loss
-        total_bce = bce_loss.mean()
-        total_mse = mse_loss.mean()
-        
-        final_loss = (total_bce + 
-                     self.peak_weight * peak_bce + 
-                     self.shape_weight * (total_mse + peak_mse))
-        
-        return final_loss
-
-# 🔥 후처리로 sharp peak 강제 생성
-class PredictionRefiner:
-    def __init__(self, smoothing_window=20, peak_threshold=0.3):
-        self.smoothing_window = smoothing_window
-        self.peak_threshold = peak_threshold
+            return torch.tensor(0.0, device=pred_logits.device)
     
-    def refine(self, predictions):
-        """예측 결과를 정제하여 sharp한 peak 생성"""
-        predictions = np.array(predictions)
+    def forward(self, pred_logits, target):
+        # 1. Focal Loss: 불균형 해결
+        focal = self.focal_loss(pred_logits, target)
         
-        # 1. 노이즈 제거 (이동평균)
-        smoothed = np.convolve(predictions, 
-                              np.ones(self.smoothing_window)/self.smoothing_window, 
-                              mode='same')
+        # 2. Dice Loss: 형태 보존
+        dice = self.dice_loss(pred_logits, target)
         
-        # 2. Peak 감지
-        peaks, properties = find_peaks(smoothed, height=self.peak_threshold, distance=100)
+        # 3. Peak Forcing: 1.0 달성
+        peak_force = self.peak_forcing_loss(pred_logits, target)
         
-        # 3. 가장 높은 peak만 선택
-        if len(peaks) > 0:
-            best_peak_idx = peaks[np.argmax(smoothed[peaks])]
-            
-            # 4. 새로운 sharp peak 생성
-            refined = np.zeros_like(predictions)
-            peak_width = 50
-            
-            for i in range(max(0, best_peak_idx - peak_width), 
-                          min(len(refined), best_peak_idx + peak_width)):
-                distance = abs(i - best_peak_idx)
-                intensity = np.exp(-0.5 * (distance / (peak_width/3)) ** 2)
-                refined[i] = intensity
+        # 총 손실
+        total_loss = (focal + 
+                     self.dice_weight * dice + 
+                     self.peak_force_weight * peak_force)
+        
+        return total_loss, {
+            'focal': focal.item(),
+            'dice': dice.item(),
+            'peak_force': peak_force.item()
+        }
+
+# 🔧 Multi-Head 모델 구현
+class MultiHeadPeakDetector(nn.Module):
+    def __init__(self, input_size=1, hidden_size=512, num_layers=2):
+        super().__init__()
+        
+        # 공통 feature extractor
+        self.feature_extractor = nn.LSTM(
+            input_size, hidden_size, num_layers,
+            batch_first=True, dropout=0.1, bidirectional=False
+        )
+        
+        # Head 1: Background/Normal 검출
+        self.background_head = nn.Sequential(
+            nn.Linear(hidden_size, 128),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(128, 32),
+            nn.ReLU(),
+            nn.Linear(32, 1),
+            nn.Sigmoid()
+        )
+        
+        # Head 2: Peak 검출 (핵심 구간)
+        self.peak_head = nn.Sequential(
+            nn.Linear(hidden_size, 256),
+            nn.ReLU(),
+            nn.Dropout(0.05),
+            nn.Linear(256, 128),
+            nn.ReLU(),
+            nn.Linear(128, 64),
+            nn.ReLU(),
+            nn.Linear(64, 1)
+        )
+        
+        # Final fusion layer
+        self.fusion = nn.Sequential(
+            nn.Linear(2, 8),  # 2개 head 출력
+            nn.ReLU(),
+            nn.Linear(8, 1)
+        )
+        
+    def forward(self, x, return_heads=False):
+        # Feature extraction
+        lstm_out, _ = self.feature_extractor(x)
+        features = lstm_out[:, -1, :]
+        
+        # 각 head별 예측
+        background_prob = self.background_head(features)
+        peak_logit = self.peak_head(features)
+        peak_prob = torch.sigmoid(peak_logit * 1.2)  # 스케일링으로 1.0 근접
+        
+        if return_heads:
+            return {
+                'background': background_prob.squeeze(),
+                'peak': peak_prob.squeeze(),
+                'peak_logit': peak_logit.squeeze()
+            }
+        
+        # 최종 융합
+        head_outputs = torch.cat([
+            background_prob,
+            peak_prob
+        ], dim=1)
+        
+        final_output = self.fusion(head_outputs)
+        return final_output.squeeze()
+
+# 🔧 Multi-Stage Trainer 구현
+class MultiStageTrainer:
+    def __init__(self, model, device):
+        self.model = model
+        self.device = device
+        
+        # 단계별 학습을 위한 다중 optimizer
+        self.background_optimizer = torch.optim.Adam(
+            list(model.module.feature_extractor.parameters()) + 
+            list(model.module.background_head.parameters()) if hasattr(model, 'module') 
+            else list(model.feature_extractor.parameters()) + 
+            list(model.background_head.parameters()),
+            lr=0.001
+        )
+        
+        self.peak_optimizer = torch.optim.Adam(
+            list(model.module.feature_extractor.parameters()) + 
+            list(model.module.peak_head.parameters()) if hasattr(model, 'module')
+            else list(model.feature_extractor.parameters()) + 
+            list(model.peak_head.parameters()),
+            lr=0.0001
+        )
+        
+        self.fusion_optimizer = torch.optim.Adam(
+            model.module.fusion.parameters() if hasattr(model, 'module') 
+            else model.fusion.parameters(),
+            lr=0.0005
+        )
+        
+        # 단계별 loss
+        self.background_loss = nn.BCELoss()
+        self.peak_loss = HybridPeakDetectionLoss()
+        self.fusion_loss = nn.MSELoss()
+        
+    def train_stage1_background(self, dataloader, epochs=15):
+        """Stage 1: Background/Normal 구간 학습"""
+        print("🔹 Stage 1: Background Detection Training")
+        
+        self.model.train()
+        for epoch in range(epochs):
+            total_loss = 0
+            batch_count = 0
+            for batch_idx, (x, y) in enumerate(dataloader):
+                x, y = x.to(self.device).unsqueeze(-1), y.to(self.device)
                 
-            return refined
+                self.background_optimizer.zero_grad()
+                
+                # Background 라벨 생성 (0.3 이하는 background)
+                background_labels = (y <= 0.3).float()
+                
+                heads = self.model(x, return_heads=True)
+                background_pred = heads['background']
+                
+                loss = self.background_loss(background_pred, background_labels)
+                loss.backward()
+                self.background_optimizer.step()
+                
+                total_loss += loss.item()
+                batch_count += 1
+                
+                if batch_idx % 100 == 0:
+                    print(f"Epoch {epoch+1}/{epochs}, Batch {batch_idx}, Loss: {loss.item():.4f}")
+                    
+                    # 중간 성능 체크 (Stage 1)
+                    if epoch > 0 and batch_idx % 500 == 0:
+                        self.model.eval()
+                        with torch.no_grad():
+                            sample_x, sample_y = next(iter(dataloader))
+                            sample_x = sample_x[:8].to(self.device).unsqueeze(-1)
+                            sample_y = sample_y[:8].to(self.device)
+                            
+                            heads = self.model(sample_x, return_heads=True)
+                            bg_acc = ((heads['background'] > 0.5) == (sample_y <= 0.3)).float().mean()
+                            print(f"   Background Accuracy: {bg_acc:.3f}")
+                        self.model.train()
         
-        return predictions
+        print(f"Stage 1 Complete. Avg Loss: {total_loss/batch_count:.4f}")
+    
+    def train_stage2_peak(self, dataloader, epochs=25):
+        """Stage 2: Peak 구간 특화 학습"""
+        print("🔹 Stage 2: Peak Detection Training")
+        
+        self.model.train()
+        for epoch in range(epochs):
+            total_loss = 0
+            batch_count = 0
+            for batch_idx, (x, y) in enumerate(dataloader):
+                x, y = x.to(self.device).unsqueeze(-1), y.to(self.device)
+                
+                self.peak_optimizer.zero_grad()
+                
+                heads = self.model(x, return_heads=True)
+                peak_logit = heads['peak_logit']
+                
+                # Peak 영역만 학습 (0.7 이상)
+                peak_mask = y >= 0.7
+                if peak_mask.any():
+                    peak_targets = y[peak_mask]
+                    peak_preds = peak_logit[peak_mask]
+                    
+                    loss, loss_components = self.peak_loss(peak_preds, peak_targets)
+                    loss.backward()
+                    self.peak_optimizer.step()
+                    
+                    total_loss += loss.item()
+                    batch_count += 1
+                    
+                    if batch_idx % 100 == 0:
+                        print(f"Epoch {epoch+1}/{epochs}, Batch {batch_idx}")
+                        print(f"Loss: {loss.item():.4f}, Components: {loss_components}")
+                        
+                        # Peak 성능 모니터링 (Stage 2)
+                        if epoch > 2 and batch_idx % 300 == 0:
+                            with torch.no_grad():
+                                peak_probs = torch.sigmoid(peak_preds)
+                                max_peak = peak_probs.max().item()
+                                mean_peak = peak_probs.mean().item()
+                                above_09 = (peak_probs > 0.9).sum().item()
+                                above_095 = (peak_probs > 0.95).sum().item()
+                                
+                                print(f"   Peak Stats - Max: {max_peak:.3f}, Mean: {mean_peak:.3f}")
+                                print(f"   Above 0.9: {above_09}, Above 0.95: {above_095}")
+        
+        print(f"Stage 2 Complete. Avg Loss: {total_loss/max(1, batch_count):.4f}")
+    
+    def train_stage3_fusion(self, dataloader, epochs=30):
+        """Stage 3: 전체 융합 학습"""
+        print("🔹 Stage 3: Full Integration Training")
+        
+        self.model.train()
+        for epoch in range(epochs):
+            total_loss = 0
+            batch_count = 0
+            for batch_idx, (x, y) in enumerate(dataloader):
+                x, y = x.to(self.device).unsqueeze(-1), y.to(self.device)
+                
+                self.fusion_optimizer.zero_grad()
+                
+                final_pred = self.model(x)
+                loss = self.fusion_loss(final_pred, y)
+                
+                loss.backward()
+                self.fusion_optimizer.step()
+                
+                total_loss += loss.item()
+                batch_count += 1
+                
+                if batch_idx % 100 == 0:
+                    print(f"Epoch {epoch+1}/{epochs}, Batch {batch_idx}, Loss: {loss.item():.4f}")
+                    
+                    # 전체 성능 모니터링 (Stage 3)
+                    if epoch > 5 and batch_idx % 200 == 0:
+                        self.model.eval()
+                        with torch.no_grad():
+                            sample_x, sample_y = next(iter(dataloader))
+                            sample_x = sample_x[:8].to(self.device).unsqueeze(-1)
+                            sample_y = sample_y[:8].to(self.device)
+                            
+                            final_pred = self.model(sample_x)
+                            max_pred = final_pred.max().item()
+                            mse = F.mse_loss(final_pred, sample_y).item()
+                            
+                            print(f"   Integration Stats - Max Pred: {max_pred:.3f}, MSE: {mse:.4f}")
+                        self.model.train()
+        
+        print(f"Stage 3 Complete. Avg Loss: {total_loss/batch_count:.4f}")
 
-# Dataset 클래스들
-class train_bin_dataset(Dataset):
-    def __init__(self, file_dir, seq_len):
-        self.needle_dis = ['0800', '1000']
-        self.seq_len = seq_len
-        self.range_list = [i for i in range(1, 18)]  # train 범위 조정
+# 🔧 데이터셋 구현 (기존과 동일)
+class EnhancedPeakDataset(Dataset):
+    def __init__(self, file_dir, seq_len, range_list, needle_dis, is_training=True):
         self.file_dir = file_dir
+        self.seq_len = seq_len
+        self.range_list = range_list
+        self.needle_dis = needle_dis
+        self.is_training = is_training
         
-        self.x_seq, self.y_seq = Data_preprocessing(
-            self.needle_dis, self.seq_len, file_dir, self.range_list)
+        # 증강 클래스 초기화
+        self.augmentor = PeakAwareAugmentation() if is_training else None
         
+        self.x_seq = []
+        self.y_seq = []
+        
+        self._load_data()
+        
+    def _create_multi_stage_labels(self, data_length, indices):
+        """다단계 confidence 라벨 생성"""
+        label_array = np.zeros(data_length, dtype=np.float32)
+        
+        if len(indices) >= 2:
+            peak_center = indices[1]
+            
+            # 5단계 라벨링
+            label_array[peak_center-200:peak_center-100] = 0.2  # 원거리 예고
+            label_array[peak_center-100:peak_center-50] = 0.4   # 중거리 신호
+            label_array[peak_center-50:peak_center-20] = 0.7    # 근거리 상승
+            label_array[peak_center-20:peak_center+20] = 1.0    # Peak 구간
+            label_array[peak_center+20:peak_center+50] = 0.7    # 하강 구간
+            label_array[peak_center+50:peak_center+100] = 0.4   # 후처리
+            
+        return label_array
+    
+    def _load_data(self):
+        """데이터 로딩 및 전처리"""
+        for ind in self.needle_dis:
+            for i in self.range_list:
+                try:
+                    file_path = os.path.join(self.file_dir, f'T2D_{ind}/SavedData_{i:03d}.bin')
+                    with open(file_path, 'rb') as file1:
+                        data = np.frombuffer(file1.read(), dtype=np.float32).reshape(-1, 5).T.copy()
+                        nor_x = data[0] - data[0][0]
+                        
+                        if np.isnan(nor_x).any() or np.isinf(nor_x).any():
+                            continue
+                            
+                        indices = np.where(data[4] == 1)[0]
+                        if len(indices) < 2:
+                            continue
+                        
+                        # 다단계 라벨 생성
+                        label_array = self._create_multi_stage_labels(len(nor_x), indices)
+                        
+                        if len(nor_x) == 0 or np.all(label_array == 0):
+                            continue
+                        
+                        # 시퀀스 생성
+                        for j in range(self.seq_len, len(nor_x) - self.seq_len):
+                            x_win = nor_x[j - self.seq_len : j]
+                            y_win = label_array[j]
+                            
+                            if np.isnan(x_win).any() or np.isinf(x_win).any():
+                                continue
+                            if np.isnan(y_win) or np.isinf(y_win):
+                                continue
+                            
+                            self.x_seq.append(torch.tensor(x_win, dtype=torch.float32))
+                            self.y_seq.append(torch.tensor(y_win, dtype=torch.float32))
+                        
+                        print(f'{ind}_{i} processed: {len(nor_x)} points')
+                        
+                except Exception as e:
+                    print(f"Error processing {ind}_{i}: {e}")
+                    continue
+        
+        print(f'Total sequences loaded: {len(self.x_seq)}')
+        
+        # 훈련 시 데이터 증강
+        if self.is_training and self.augmentor and len(self.x_seq) > 0:
+            self._apply_augmentation()
+    
+    def _apply_augmentation(self):
+        """데이터 증강 적용"""
+        print("Applying data augmentation...")
+        
+        original_count = len(self.x_seq)
+        augmented_data = []
+        augmented_labels = []
+        
+        # Peak 샘플 식별 및 증강
+        peak_samples = []
+        for i, y in enumerate(self.y_seq):
+            if y.item() > 0.7:  # Peak 샘플
+                peak_samples.append(i)
+        
+        print(f"Found {len(peak_samples)} peak samples out of {original_count}")
+        
+        # Peak 샘플 2배 증강
+        for idx in peak_samples[:min(len(peak_samples), 1000)]:  # 최대 1000개만
+            x_orig = self.x_seq[idx].numpy()
+            y_orig = self.y_seq[idx].numpy()
+            
+            # 2개의 증강 버전 생성
+            for _ in range(2):
+                # 노이즈 추가
+                x_aug = self.augmentor.add_realistic_noise(x_orig.copy(), [len(x_orig)//2])
+                
+                # 진폭 스케일링
+                x_aug = self.augmentor.amplitude_scaling(x_aug)
+                
+                augmented_data.append(torch.tensor(x_aug, dtype=torch.float32))
+                augmented_labels.append(torch.tensor(y_orig, dtype=torch.float32))
+        
+        # 증강된 데이터 추가
+        self.x_seq.extend(augmented_data)
+        self.y_seq.extend(augmented_labels)
+        
+        print(f"Augmentation complete: {original_count} → {len(self.x_seq)} samples")
+    
     def __len__(self):
-        return len(self.y_seq)
+        return len(self.x_seq)
     
     def __getitem__(self, idx):
         return self.x_seq[idx], self.y_seq[idx]
 
-class val_bin_dataset(Dataset):
-    def __init__(self, file_dir, seq_len):
-        self.needle_dis = ['0800', '1000']
-        self.seq_len = seq_len
-        self.range_list = [i for i in range(18, 21)]
-        self.file_dir = file_dir
+# 🔧 Comprehensive Trainer
+class ComprehensiveTrainer:
+    def __init__(self, model, device, save_dir="./models"):
+        self.model = model
+        self.device = device
+        self.save_dir = save_dir
         
-        self.x_seq, self.y_seq = Data_preprocessing(
-            self.needle_dis, self.seq_len, file_dir, self.range_list)
+        os.makedirs(save_dir, exist_ok=True)
         
-    def __len__(self):
-        return len(self.y_seq)
-    
-    def __getitem__(self, idx):
-        return self.x_seq[idx], self.y_seq[idx]
-
-# 🔥 개선된 학습 함수
-def train_precise_model():
-    # 데이터 준비 - 확실한 경로 설정
-    file_dir = ''  # 실제 데이터 경로
-    seq_len = 512
-    batch_size = 256  # 128 → 256으로 변경
-    
-    train_ds = train_bin_dataset(file_dir, seq_len)
-    val_ds = val_bin_dataset(file_dir, seq_len)
-    
-    print(f'Train: {len(train_ds)}, Val: {len(val_ds)}')
-    
-    # 가중치 샘플링
-    binary_labels = [1 if y.item() > 0.5 else 0 for _, y in train_ds]
-    class_counts = [binary_labels.count(0), binary_labels.count(1)]
-    class_weights = [1.0 / class_counts[0], 1.0 / class_counts[1]]
-    weights = [class_weights[label] for label in binary_labels]
-    sampler = WeightedRandomSampler(weights, num_samples=len(weights), replacement=True)
-    
-    train_dl = DataLoader(train_ds, batch_size=batch_size, sampler=sampler, drop_last=True)
-    val_dl = DataLoader(val_ds, batch_size=batch_size, shuffle=False, drop_last=True)
-    
-    # 🔥 개선된 모델 사용
-    model = ImprovedLSTMDetector(input_size=1, hidden_size=256, num_layers=2, output_size=1)
-    model = nn.DataParallel(model).to(device)
-    
-    # 🔥 개선된 학습 설정 - lr 증가, patience 증가
-    optimizer = optim.AdamW(model.parameters(), lr=0.00005, weight_decay=0.01)  # 0.00001 → 0.00005
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=5, factor=0.7)  # verbose 제거
-    criterion = PeakAwareLoss(peak_weight=3.0, shape_weight=2.0)  # Peak 가중치 부여
-    
-    # 후처리 객체
-    refiner = PredictionRefiner()
-    
-    # 학습 설정
-    num_epochs = 50
-    patience = 10  # 5 → 10으로 증가
-    best_val_loss = float('inf')
-    early_stop_counter = 0
-    min_delta = 0.0002
-    
-    train_losses = []
-    val_losses = []
-    val_aucs = []
-    
-    # validation 결과를 저장하기 위한 리스트 (시각화를 위해)
-    val_losses_history = []
-    val_aucs_history = []
-    val_preds_history = []   # 각 epoch별 전체 예측값
-    val_labels_history = []  # 각 epoch별 전체 정답
-    
-    for epoch in range(num_epochs):
-        print(f"\n🚀 Epoch {epoch+1}/{num_epochs}\n--------------------------------------------------------")
-        model.train()
-        epoch_loss = 0
-
-        for batch, (X, y) in enumerate(train_dl):
-            optimizer.zero_grad()
-            X, y = X.to(device).unsqueeze(-1), y.to(device).float().squeeze()
-            pred = model(X).squeeze()
-            loss = criterion(pred, y)  # 🎯 BCEWithLogitsLoss 사용
-            loss.backward()
-            optimizer.step()
-
-            epoch_loss += loss.item()
-            train_loss = epoch_loss / len(train_dl)
-        print("train loss: ", train_loss)
-
-        model.eval()
-        val_epoch_loss = 0
-        # all_x_data = []
+        # 다단계 학습을 위한 컴포넌트
+        self.multi_stage_trainer = MultiStageTrainer(model, device)
+        
+        # 메트릭 저장
+        self.train_losses = []
+        self.val_losses = []
+        self.val_aucs = []
+        self.peak_achievements = []
+        
+    def evaluate_comprehensive(self, val_loader):
+        """포괄적 평가"""
+        self.model.eval()
         all_preds = []
-        # all_val_preds = []
         all_labels = []
-
+        peak_preds = []
+        
         with torch.no_grad():
-            for batch, (X, y) in enumerate(val_dl):
-                X, val_labels = X.to(device).unsqueeze(-1), y.to(device).float()
-                val_preds = model(X).squeeze()  # raw logits
-                loss = criterion(val_preds, val_labels)
-                val_epoch_loss += loss.item()
-                probas = torch.sigmoid(val_preds)  # 확률값으로 변환
-                X_data = X.cpu().numpy()
-                # all_val_preds.extend(val_preds.cpu().numpy())
-                # all_x_data.extend(X_data[-1])
-                all_preds.extend(probas.cpu().numpy())
+            for x, y in val_loader:
+                x, y = x.to(self.device).unsqueeze(-1), y.to(self.device)
+                
+                # 메인 예측
+                main_pred = torch.sigmoid(self.model(x))
+                
+                all_preds.extend(main_pred.cpu().numpy())
                 all_labels.extend(y.cpu().numpy())
+                
+                # Peak 영역 별도 평가
+                peak_mask = y > 0.8
+                if peak_mask.any():
+                    peak_preds.extend(main_pred[peak_mask].cpu().numpy())
+        
+        # 다양한 메트릭 계산
+        results = {}
+        
+        # 1. 전체 AUC (다양한 임계값)
+        binary_labels_07 = [1 if l > 0.7 else 0 for l in all_labels]
+        
+        if len(set(binary_labels_07)) > 1:
+            results['auc_0.7'] = roc_auc_score(binary_labels_07, all_preds)
+        
+        # 2. Peak 성능
+        if peak_preds:
+            results['peak_max'] = max(peak_preds)
+            results['peak_mean'] = np.mean(peak_preds)
+            results['peak_above_0.9'] = sum(1 for p in peak_preds if p > 0.9)
+            results['peak_above_0.95'] = sum(1 for p in peak_preds if p > 0.95)
+            results['peak_above_0.98'] = sum(1 for p in peak_preds if p > 0.98)
+        
+        return results
+    
+    def train_progressive(self, train_loader, val_loader):
+        """점진적 학습 실행"""
+        print("🚀 Starting Progressive Training")
+        
+        # Stage 1: Background mastery
+        print("\n" + "="*60)
+        self.multi_stage_trainer.train_stage1_background(train_loader, epochs=15)
+        
+        # Stage 2: Peak specialization  
+        print("\n" + "="*60)
+        self.multi_stage_trainer.train_stage2_peak(train_loader, epochs=25)
+        
+        # Stage 3: Integration
+        print("\n" + "="*60)
+        self.multi_stage_trainer.train_stage3_fusion(train_loader, epochs=30)
+        
+        # 최종 평가
+        final_results = self.evaluate_comprehensive(val_loader)
+        print("\n🎯 Final Results:")
+        for key, value in final_results.items():
+            print(f"   {key}: {value:.4f}")
+        
+        # 모델 저장
+        torch.save(self.model.state_dict(), 
+                  os.path.join(self.save_dir, "progressive_peak_detector.pth"))
+        
+        return final_results
 
-        val_loss = val_epoch_loss / len(val_dl)
-        binary_labels = [1 if label > 0.8 else 0 for label in all_labels]
-        val_auc = roc_auc_score(binary_labels, all_preds)
+# 🔧 메인 실행 함수
+def main_training_pipeline():
+    # 하이퍼파라미터
+    file_dir = '/home/ibom002/dataset/Data_20250709'
+    seq_len = 512
+    # GPU 3개 사용시 배치 크기 증가
+    batch_size = 384  # 메모리 안전을 위해 조정
+    
+    print(f"🔧 Using device: {device}")
+    print(f"🔧 Batch size optimized for {torch.cuda.device_count()} GPUs: {batch_size}")
+    
+    # 데이터셋 생성
+    print("📂 Loading datasets...")
+    train_ds = EnhancedPeakDataset(
+        file_dir, seq_len, 
+        range_list=[i for i in range(1, 19)], 
+        needle_dis=['0800', '1000'],
+        is_training=True
+    )
+    
+    val_ds = EnhancedPeakDataset(
+        file_dir, seq_len,
+        range_list=[i for i in range(18, 21)],
+        needle_dis=['0800', '1000'], 
+        is_training=False
+    )
+    
+    print(f"📊 Train samples: {len(train_ds)}, Val samples: {len(val_ds)}")
+    
+    if len(train_ds) == 0 or len(val_ds) == 0:
+        print("❌ No data loaded! Check file paths and data.")
+        return None, None
+    
+    # 스마트 샘플러 사용
+    try:
+        smart_sampler = SmartBatchSampler(train_ds, batch_size, peak_ratio=0.4)
+        train_loader = DataLoader(train_ds, batch_sampler=smart_sampler)
+    except:
+        print("⚠️ Smart sampler failed, using regular sampler")
+        train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
+    
+    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False)
+    
+    # 모델 생성
+    print("🏗️ Creating model...")
+    model = MultiHeadPeakDetector(input_size=1, hidden_size=512, num_layers=2)
+    
+    # GPU 3개 사용 설정
+    if torch.cuda.device_count() > 1:
+        print(f"🚀 Using {torch.cuda.device_count()} GPUs with DataParallel!")
+        model = nn.DataParallel(model, device_ids=[0, 1, 2])
+    model = model.to(device)
+    
+    # 트레이너 생성 및 학습
+    trainer = ComprehensiveTrainer(model, device)
+    
+    print("🎓 Starting training...")
+    final_results = trainer.train_progressive(train_loader, val_loader)
+    
+    return model, final_results
 
-        print(f'🔹 Validation Loss: {val_loss:.10f}, ROC-AUC Score: {val_auc:.5f}')
-
-        train_losses.append(train_loss)
-        val_losses.append(val_loss)
-        val_aucs.append(val_auc)
-
-        # validation 결과 저장 (시각화 용)
-        val_losses_history.append(val_loss)
-        val_aucs_history.append(val_auc)
-        val_preds_history.append(val_preds)
-        val_labels_history.append(val_labels)
-
-        # 🎯 조기 종료 체크: val_loss 기준
-        if val_loss < (best_val_loss - min_delta):
-            best_val_loss = val_loss
-            early_stop_counter = 0
-            torch.save(model.state_dict(), "./model/best_model_with_newdata_tuning.pth")  # 🎯 모델 저장
-            print(f"✅ Model saved! New best val_loss: {best_val_loss:.5f}")
-        else:
-            early_stop_counter += 1
-            print(f"⚠️ Early stopping counter: {early_stop_counter}/{patience}")
-
-        if early_stop_counter >= patience:
-            print("⏹ Early stopping activated. Stopping training.")
-            break  # 🎯 학습 중단
-
-    print('🎯 Training Completed! Best Validation Loss:', best_val_loss)
-    return model, refiner
-
-# 실행
 if __name__ == "__main__":
-    model, refiner = train_precise_model()
+    try:
+        model, results = main_training_pipeline()
+        if results:
+            print("\n✅ Training completed successfully!")
+            print("📊 Final Results Summary:")
+            for key, value in results.items():
+                print(f"   {key}: {value:.4f}")
+        else:
+            print("❌ Training failed!")
+    except Exception as e:
+        print(f"❌ Error during training: {e}")
+        import traceback
+        traceback.print_exc()
