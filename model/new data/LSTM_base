@@ -16,7 +16,6 @@ print('Device:', device)
 print('Current cuda device:', torch.cuda.current_device())
 print('Count of using GPUs:', torch.cuda.device_count())
 torch.cuda.manual_seed_all(42)
-
 def gaussian_kernel1d(kernel_size, sigma):
     # kernel_size는 홀수여야 함
     x = torch.arange(kernel_size, dtype=torch.float32) - (kernel_size - 1) / 2.0
@@ -38,8 +37,7 @@ def replace_zeros_with_random_torch(tensor, low=0.0, high=0.1, seed=42):
     random_vals = torch.empty(mask.sum(), device=tensor.device).uniform_(low, high)
     tensor[mask] = random_vals
     return tensor
-
-    def Data_preprocessing(needle_dis, seq_len, file_dir, range_list):
+def Data_preprocessing(needle_dis, seq_len, file_dir, range_list):
     x_seq = []
     y_seq = []
     motor_x_seq = []
@@ -180,8 +178,7 @@ def replace_zeros_with_random_torch(tensor, low=0.0, high=0.1, seed=42):
     
     print(f'Total sequences: {len(x_seq)}')
     return x_seq, y_seq
-
-    class train_bin_dataset(Dataset):
+class train_bin_dataset(Dataset):
     def __init__(self, file_dir, seq_len):
         self.needle_dis = ['0800', '1000']  # 0600 제거
         self.seq_len = seq_len
@@ -214,8 +211,7 @@ class val_bin_dataset(Dataset):
     
     def __getitem__(self, idx):
         return self.x_seq[idx], self.y_seq[idx]
-\
-file_dir = ''  # 새로운 데이터 경로
+file_dir = '/home/ibom002/dataset/Data_20250709'  # 새로운 데이터 경로
 seq_len = 512
 batch_size = 512
 
@@ -242,7 +238,6 @@ val_dl = DataLoader(val_ds, batch_size=batch_size, shuffle=False, drop_last=True
 
 print('train_dl_len', len(train_dl))
 print('val_dl_len', len(val_dl))
-
 class LSTMAnomalyDetector(nn.Module):
     def __init__(self, input_size, hidden_size, num_layers, output_size):
         super(LSTMAnomalyDetector, self).__init__()
@@ -264,7 +259,7 @@ class LSTMAnomalyDetector(nn.Module):
         fc2_out = F.relu(self.fc2(fc1_out))
         fc2_out = self.dropout(fc2_out)
         return self.fc3(fc2_out)
-ef train(train_dl, val_dl, model, criterion, optimizer, epoch, eval_every=1000):
+def train(train_dl, val_dl, model, criterion, optimizer, epoch, eval_every=1000):
     model.train()
     epoch_loss = 0
 
@@ -347,7 +342,6 @@ def val(val_dl, model, criterion):
         auc_score = 0.0
     
     return avg_loss, auc_score, all_preds, all_labels
-# ✅ 모델 설정 옵티마이저 & 손실 함수
 model = LSTMAnomalyDetector(input_size=1, hidden_size=512, num_layers=2, output_size=1)
 model = nn.DataParallel(model).to(device)  # 멀티 GPU 활용
 
