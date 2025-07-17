@@ -1,0 +1,463 @@
+import os
+import numpy as np
+import matplotlib.pyplot as plt
+import random
+from collections import defaultdict
+import copy
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from sklearn.metrics import roc_auc_score
+from torch.utils.data import DataLoader, Dataset
+import torch.nn.functional as F
+
+# GPU 설정
+os.environ["CUDA_DEVICE_ORDER"]="PCI_BUS_ID"
+os.environ["CUDA_VISIBLE_DEVICES"]= "0,1,2"
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print('Device:', device)
+torch.cuda.manual_seed_all(42)
+
+def gaussian_kernel1d(kernel_size, sigma):
+    x = torch.arange(kernel_size, dtype=torch.float32) - (kernel_size - 1) / 2.0
+    kernel = torch.exp(-0.5 * (x / sigma) ** 2)
+    kernel = kernel / kernel.sum()
+    return kernel
+
+def smooth_label_signal(signal, kernel_size=11, sigma=2.0):
+    kernel = gaussian_kernel1d(kernel_size, sigma).to(signal.device)
+    kernel = kernel.view(1, 1, kernel_size)
+    padding = kernel_size // 2
+    smoothed_signal = F.conv1d(signal, kernel, padding=padding)
+    return smoothed_signal
+
+def replace_zeros_with_random_torch(tensor, low=0.0, high=0.1, seed=42):
+    torch.manual_seed(seed)
+    mask = tensor <= 0.1
+    random_vals = torch.empty(mask.sum(), device=tensor.device).uniform_(low, high)
+    tensor[mask] = random_vals
+    return tensor
+
+# ==================== File-level Meta-Learning Dataset ====================
+class FileBasedMetaDataset:
+    """각 파일을 별도 task로 관리하는 Meta-learning Dataset"""
+    
+    def __init__(self, file_dir, seq_len=512):
+        self.file_dir = file_dir
+        self.seq_len = seq_len
+        self.needle_distances = ['0800', '1000']
+        
+        # 모든 파일을 개별 task로 로드
+        self.all_tasks = self._load_all_file_tasks()
+        
+        print(f"📋 Total tasks loaded: {len(self.all_tasks)}")
+        
+    def _load_all_file_tasks(self):
+        """각 파일을 별도 task로 로드"""
+        all_tasks = []
+        
+        for needle_dist in self.needle_distances:
+            for file_idx in range(1, 21):  # 1~20 파일
+                task_data = self._load_single_file_task(needle_dist, file_idx)
+                if task_data is not None:
+                    all_tasks.append(task_data)
+                    
+        return all_tasks
+    
+    def _load_single_file_task(self, needle_dist, file_idx):
+        """단일 파일을 하나의 task로 로드"""
+        try:
+            file_path = os.path.join(self.file_dir, f'T2D_{needle_dist}/SavedData_{file_idx:03d}.bin')
+            
+            with open(file_path, 'rb') as file1:
+                data = np.frombuffer(file1.read(), dtype=np.float32).reshape(-1, 5).T.copy()
+                nor_x = data[0] - data[0][0]
+                
+                # 유효성 체크
+                if np.isnan(nor_x).any() or np.isinf(nor_x).any():
+                    return None
+                    
+                indices = np.where(data[4] == 1)[0]
+                if len(indices) < 2:
+                    return None
+                
+                # 라벨 생성
+                array_size = len(data[4])
+                label_array = np.full(array_size, 0, dtype=np.float32)
+                label_array[indices[1]-20 : indices[1]+20] = 1
+                
+                # 스무딩
+                label_tensor = torch.tensor(label_array, dtype=torch.float32).unsqueeze(0).unsqueeze(0)
+                smoothed_signal = smooth_label_signal(label_tensor, kernel_size=10001, sigma=500.0)
+                smoothed_signal = smoothed_signal.squeeze(0).squeeze(0)
+                
+                # 정규화
+                max_val = smoothed_signal.max()
+                if max_val > 1e-6:
+                    smoothed_signal = smoothed_signal / max_val
+                else:
+                    smoothed_signal = torch.ones_like(smoothed_signal) * 0.01
+                
+                # 후처리
+                smoothed_signal = replace_zeros_with_random_torch(smoothed_signal, low=0.01, high=0.1)
+                smoothed_signal = torch.clamp(smoothed_signal, 0.0, 1.0)
+                
+                # 시퀀스 생성
+                x_sequences = []
+                y_sequences = []
+                
+                for j in range(self.seq_len, len(nor_x) - self.seq_len):
+                    x_win = nor_x[j - self.seq_len : j]
+                    
+                    if np.isnan(x_win).any() or np.isinf(x_win).any():
+                        continue
+                    
+                    y_win = smoothed_signal[j]
+                    
+                    if torch.isnan(y_win) or torch.isinf(y_win):
+                        continue
+                    
+                    x_sequences.append(torch.tensor(x_win, dtype=torch.float32))
+                    y_sequences.append(torch.tensor(y_win.item(), dtype=torch.float32))
+                
+                if len(x_sequences) < 50:  # 최소 시퀀스 수 체크
+                    return None
+                    
+                return {
+                    'task_id': f"{needle_dist}_file_{file_idx:03d}",
+                    'needle_dist': needle_dist,
+                    'file_idx': file_idx,
+                    'x_seq': x_sequences,
+                    'y_seq': y_sequences,
+                    'total_sequences': len(x_sequences)
+                }
+                
+        except Exception as e:
+            print(f"⚠️ Error loading {needle_dist}_file_{file_idx:03d}: {e}")
+            return None
+    
+    def sample_support_query(self, task_data, k_shot=5, query_size=15):
+        """단일 task에서 Support/Query set 샘플링"""
+        total_sequences = len(task_data['x_seq'])
+        
+        if total_sequences < k_shot + query_size:
+            # 시퀀스가 부족하면 비율로 조정
+            k_shot = max(1, total_sequences // 3)
+            query_size = total_sequences - k_shot
+        
+        # 랜덤 샘플링
+        indices = random.sample(range(total_sequences), k_shot + query_size)
+        support_indices = indices[:k_shot]
+        query_indices = indices[k_shot:]
+        
+        support_data = {
+            'x': [task_data['x_seq'][i] for i in support_indices],
+            'y': [task_data['y_seq'][i] for i in support_indices]
+        }
+        
+        query_data = {
+            'x': [task_data['x_seq'][i] for i in query_indices],
+            'y': [task_data['y_seq'][i] for i in query_indices]
+        }
+        
+        return support_data, query_data
+    
+    def get_cross_needle_split(self):
+        """Cross-needle evaluation을 위한 분할"""
+        needle_0800_tasks = [task for task in self.all_tasks if task['needle_dist'] == '0800']
+        needle_1000_tasks = [task for task in self.all_tasks if task['needle_dist'] == '1000']
+        
+        return needle_0800_tasks, needle_1000_tasks
+    
+    def get_file_based_split(self, train_ratio=0.8):
+        """파일 기반 train/test 분할"""
+        random.shuffle(self.all_tasks)
+        split_idx = int(len(self.all_tasks) * train_ratio)
+        
+        train_tasks = self.all_tasks[:split_idx]
+        test_tasks = self.all_tasks[split_idx:]
+        
+        return train_tasks, test_tasks
+
+# ==================== MAML Model ====================
+class MAMLPunctureDetector(nn.Module):
+    """빠른 적응을 위한 경량 모델"""
+    
+    def __init__(self, input_size=1, hidden_size=128, num_layers=1, output_size=1):
+        super(MAMLPunctureDetector, self).__init__()
+        
+        # 🔧 더 작고 빠른 모델 (파일당 적은 데이터이므로)
+        self.lstm = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True, dropout=0.1)
+        self.fc1 = nn.Linear(hidden_size, 64)
+        self.fc2 = nn.Linear(64, 32) 
+        self.fc3 = nn.Linear(32, output_size)
+        self.dropout = nn.Dropout(0.1)
+        
+    def forward(self, x):
+        lstm_out, _ = self.lstm(x)
+        lstm_out = lstm_out[:, -1, :]
+        
+        fc1_out = F.relu(self.fc1(lstm_out))
+        fc1_out = self.dropout(fc1_out)
+        fc2_out = F.relu(self.fc2(fc1_out))
+        
+        return self.fc3(fc2_out)
+    
+    def clone(self):
+        return copy.deepcopy(self)
+
+# ==================== MAML Trainer ====================
+class FileBasedMAMLTrainer:
+    """파일 기반 MAML 학습"""
+    
+    def __init__(self, model, meta_lr=0.001, inner_lr=0.01, inner_steps=3):
+        self.model = model.to(device)
+        self.meta_lr = meta_lr
+        self.inner_lr = inner_lr
+        self.inner_steps = inner_steps  # 파일당 데이터가 적으므로 줄임
+        
+        self.meta_optimizer = optim.Adam(self.model.parameters(), lr=meta_lr)
+        self.criterion = nn.BCEWithLogitsLoss()
+        
+    def inner_loop_adaptation(self, support_data, task_model):
+        """Support set으로 빠른 적응"""
+        if len(support_data['x']) == 0:
+            return task_model
+            
+        support_x = torch.stack(support_data['x']).to(device).unsqueeze(-1)
+        support_y = torch.stack(support_data['y']).to(device)
+        
+        # Task-specific optimizer
+        task_optimizer = optim.SGD(task_model.parameters(), lr=self.inner_lr)
+        
+        # Inner loop
+        for step in range(self.inner_steps):
+            task_optimizer.zero_grad()
+            
+            predictions = task_model(support_x).squeeze()
+            loss = self.criterion(predictions, support_y)
+            
+            loss.backward()
+            task_optimizer.step()
+            
+        return task_model
+    
+    def meta_update_step(self, batch_tasks):
+        """Meta gradient 계산 및 업데이트"""
+        meta_loss = 0.0
+        valid_tasks = 0
+        
+        self.meta_optimizer.zero_grad()
+        
+        for task_data in batch_tasks:
+            try:
+                # 1️⃣ 모델 복사
+                task_model = self.model.clone()
+                
+                # 2️⃣ Support/Query 분할
+                support_data, query_data = task_data
+                
+                if len(query_data['x']) == 0:
+                    continue
+                
+                # 3️⃣ Inner loop 적응
+                adapted_model = self.inner_loop_adaptation(support_data, task_model)
+                
+                # 4️⃣ Query set 평가
+                query_x = torch.stack(query_data['x']).to(device).unsqueeze(-1)
+                query_y = torch.stack(query_data['y']).to(device)
+                
+                query_predictions = adapted_model(query_x).squeeze()
+                query_loss = self.criterion(query_predictions, query_y)
+                
+                meta_loss += query_loss
+                valid_tasks += 1
+                
+            except Exception as e:
+                print(f"⚠️ Error in meta update: {e}")
+                continue
+        
+        if valid_tasks > 0:
+            meta_loss = meta_loss / valid_tasks
+            meta_loss.backward()
+            self.meta_optimizer.step()
+            return meta_loss.item()
+        else:
+            return float('inf')
+    
+    def evaluate_on_task(self, task_data, k_shot=5):
+        """단일 task에서 few-shot 성능 평가"""
+        try:
+            support_data, query_data = task_data
+            
+            if len(query_data['x']) == 0:
+                return 0.5, [], []
+            
+            # 모델 적응
+            task_model = self.model.clone()
+            adapted_model = self.inner_loop_adaptation(support_data, task_model)
+            
+            # 평가
+            adapted_model.eval()
+            with torch.no_grad():
+                query_x = torch.stack(query_data['x']).to(device).unsqueeze(-1)
+                query_y = torch.stack(query_data['y']).to(device)
+                
+                predictions = adapted_model(query_x).squeeze()
+                probas = torch.sigmoid(predictions)
+                
+                # AUC 계산
+                binary_labels = [1 if y.item() > 0.8 else 0 for y in query_y]
+                if len(set(binary_labels)) > 1:
+                    auc = roc_auc_score(binary_labels, probas.cpu().numpy())
+                else:
+                    auc = 0.5
+                    
+            return auc, probas.cpu().numpy(), query_y.cpu().numpy()
+            
+        except Exception as e:
+            print(f"⚠️ Error in evaluation: {e}")
+            return 0.5, [], []
+
+# ==================== Training Functions ====================
+def train_file_based_maml():
+    """파일 기반 Meta-learning 학습"""
+    
+    print("🔄 Loading file-based meta dataset...")
+    meta_dataset = FileBasedMetaDataset(
+        file_dir='/home/ibom002/dataset/Data_20250709',
+        seq_len=512
+    )
+    
+    if len(meta_dataset.all_tasks) < 10:
+        print("⚠️ Insufficient tasks for meta-learning")
+        return
+    
+    # 모델 초기화
+    model = MAMLPunctureDetector(
+        input_size=1, 
+        hidden_size=128, 
+        num_layers=1, 
+        output_size=1
+    )
+    
+    trainer = FileBasedMAMLTrainer(
+        model=model,
+        meta_lr=0.001,
+        inner_lr=0.01,
+        inner_steps=3
+    )
+    
+    # Train/Test 분할
+    train_tasks, test_tasks = meta_dataset.get_file_based_split(train_ratio=0.8)
+    
+    print(f"📊 Train tasks: {len(train_tasks)}, Test tasks: {len(test_tasks)}")
+    
+    # Meta-training
+    print("🚀 Starting File-based Meta-Learning...")
+    
+    num_meta_epochs = 50
+    tasks_per_batch = 4
+    k_shot = 3  # 파일당 데이터가 적으므로 줄임
+    query_size = 10
+    
+    best_avg_auc = 0.0
+    
+    for meta_epoch in range(num_meta_epochs):
+        
+        # 배치 샘플링
+        if len(train_tasks) < tasks_per_batch:
+            batch_task_data = train_tasks
+        else:
+            batch_task_data = random.sample(train_tasks, tasks_per_batch)
+        
+        # Support/Query 분할
+        batch_tasks = []
+        for task in batch_task_data:
+            support_data, query_data = meta_dataset.sample_support_query(
+                task, k_shot=k_shot, query_size=query_size
+            )
+            batch_tasks.append((support_data, query_data))
+        
+        # Meta update
+        meta_loss = trainer.meta_update_step(batch_tasks)
+        
+        # 평가 (매 10 epoch마다)
+        if meta_epoch % 10 == 0:
+            print(f"\n📊 Meta-Epoch {meta_epoch}")
+            print(f"Meta Loss: {meta_loss:.6f}")
+            
+            # Test tasks에서 평가
+            test_aucs = []
+            for test_task in test_tasks[:5]:  # 5개 task만 평가
+                support_data, query_data = meta_dataset.sample_support_query(
+                    test_task, k_shot=k_shot, query_size=15
+                )
+                auc, _, _ = trainer.evaluate_on_task((support_data, query_data), k_shot)
+                test_aucs.append(auc)
+            
+            avg_auc = np.mean(test_aucs)
+            print(f"Test AUC: {avg_auc:.4f} ± {np.std(test_aucs):.4f}")
+            
+            # Best model 저장
+            if avg_auc > best_avg_auc:
+                best_avg_auc = avg_auc
+                torch.save(trainer.model.state_dict(), "./model/file_maml_best.pth")
+                print(f"✅ Best model saved! AUC: {best_avg_auc:.4f}")
+    
+    print(f"🎯 File-based Meta-Learning Completed! Best AUC: {best_avg_auc:.4f}")
+    
+    # Cross-needle evaluation
+    print("\n🧪 Cross-needle Evaluation...")
+    cross_needle_evaluation(trainer, meta_dataset)
+
+def cross_needle_evaluation(trainer, meta_dataset):
+    """Cross-needle generalization 평가"""
+    
+    needle_0800_tasks, needle_1000_tasks = meta_dataset.get_cross_needle_split()
+    
+    print(f"0800 tasks: {len(needle_0800_tasks)}, 1000 tasks: {len(needle_1000_tasks)}")
+    
+    # 0800으로 학습 → 1000에서 테스트
+    print("\n🔬 0800 → 1000 Generalization")
+    test_cross_needle_performance(trainer, meta_dataset, needle_0800_tasks, needle_1000_tasks)
+    
+    # 1000으로 학습 → 0800에서 테스트  
+    print("\n🔬 1000 → 0800 Generalization")
+    test_cross_needle_performance(trainer, meta_dataset, needle_1000_tasks, needle_0800_tasks)
+
+def test_cross_needle_performance(trainer, meta_dataset, source_tasks, target_tasks):
+    """Cross-needle 성능 테스트"""
+    
+    if len(target_tasks) == 0:
+        print("⚠️ No target tasks available")
+        return
+    
+    shot_sizes = [1, 3, 5]
+    
+    for k_shot in shot_sizes:
+        aucs = []
+        
+        for target_task in target_tasks[:5]:  # 5개만 테스트
+            try:
+                support_data, query_data = meta_dataset.sample_support_query(
+                    target_task, k_shot=k_shot, query_size=10
+                )
+                
+                auc, _, _ = trainer.evaluate_on_task((support_data, query_data), k_shot)
+                aucs.append(auc)
+                
+            except Exception as e:
+                print(f"⚠️ Error in cross-needle test: {e}")
+                continue
+        
+        if aucs:
+            avg_auc = np.mean(aucs)
+            std_auc = np.std(aucs)
+            print(f"{k_shot}-shot AUC: {avg_auc:.4f} ± {std_auc:.4f}")
+        else:
+            print(f"{k_shot}-shot: No valid results")
+
+if __name__ == "__main__":
+    train_file_based_maml()
