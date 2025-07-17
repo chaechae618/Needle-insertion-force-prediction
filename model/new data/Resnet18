@@ -1,0 +1,556 @@
+import os
+import numpy as np
+import matplotlib.pyplot as plt
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from sklearn.metrics import roc_auc_score
+from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
+import torch.nn.functional as F
+
+os.environ["CUDA_DEVICE_ORDER"]="PCI_BUS_ID"  # Arrange GPU devices starting from 0
+os.environ["CUDA_VISIBLE_DEVICES"]= "0,1,2"  # Set the GPUs 0,1,2 to use
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print('Device:', device)
+print('Current cuda device:', torch.cuda.current_device())
+print('Count of using GPUs:', torch.cuda.device_count())
+torch.cuda.manual_seed_all(42)
+
+# ===================== 데이터 전처리 함수들 (기존과 동일) =====================
+def gaussian_kernel1d(kernel_size, sigma):
+    # kernel_size는 홀수여야 함
+    x = torch.arange(kernel_size, dtype=torch.float32) - (kernel_size - 1) / 2.0
+    kernel = torch.exp(-0.5 * (x / sigma) ** 2)
+    kernel = kernel / kernel.sum()  # 합이 1이 되도록 정규화
+    return kernel
+
+def smooth_label_signal(signal, kernel_size=11, sigma=2.0):
+    kernel = gaussian_kernel1d(kernel_size, sigma).to(signal.device)
+    kernel = kernel.view(1, 1, kernel_size)  # conv1d용 shape
+    padding = kernel_size // 2  # 입력과 출력 길이 동일하게 유지
+    smoothed_signal = F.conv1d(signal, kernel, padding=padding)
+    return smoothed_signal
+
+def replace_zeros_with_random_torch(tensor, low=0.0, high=0.1, seed=42):
+    torch.manual_seed(seed)
+    mask = tensor <= 0.1
+    # mask가 True인 위치에 대해 랜덤 값을 생성해서 대입
+    random_vals = torch.empty(mask.sum(), device=tensor.device).uniform_(low, high)
+    tensor[mask] = random_vals
+    return tensor
+
+def Data_preprocessing(needle_dis, seq_len, file_dir, range_list):
+    x_seq = []
+    y_seq = []
+    
+    for ind in needle_dis:
+        for i in range_list:
+            try:
+                file_path = os.path.join(file_dir, f'T2D_{ind}/SavedData_{i:03d}.bin')
+                with open(file_path, 'rb') as file1:
+                    data = np.frombuffer(file1.read(), dtype=np.float32).reshape(-1, 5).T.copy()
+                    nor_x = data[0] - data[0][0]
+                    
+                    # 🔍 디버깅: 초기 데이터 체크
+                    print(f"\n=== {ind}_{i} 처리 중 ===")
+                    print(f"Raw data[0] range: [{data[0].min():.3f}, {data[0].max():.3f}]")
+                    print(f"Normalized nor_x range: [{nor_x.min():.3f}, {nor_x.max():.3f}]")
+                    
+                    # 🔍 NaN/Inf 체크
+                    if np.isnan(nor_x).any() or np.isinf(nor_x).any():
+                        print(f"⚠️ Invalid values in nor_x for {ind}_{i}")
+                        continue
+                        
+                    indices = np.where(data[4] == 1)[0]
+                    print(f"Puncture indices: {indices}")
+                    
+                    if len(indices) < 2:
+                        print(f"⚠️ Less than 2 puncture points found in {ind}_{i}")
+                        continue
+                    
+                    array_size = len(data[4])
+                    label_array = np.full(array_size, 0, dtype=np.float32)
+                    label_array[indices[1]-20 : indices[1]+20] = 1
+                    
+                    print(f"Original label_array: min={label_array.min():.3f}, max={label_array.max():.3f}, sum={label_array.sum():.0f}")
+                    
+                    if ind == '0600':
+                        try:
+                            # 임계값을 초과하는 데이터의 인덱스 찾기
+                            indices_high = np.where(data[0] > 3.05)[0]
+                            indices_low = np.where(data[0] < -3.05)[0]
+                            # 100 이상 차이나는 지점 찾기
+                            idx_diff_low = np.where(np.diff(indices_low) > 100)[0]
+
+                            if len(idx_diff_low) > 0 and len(indices_high) > 0:
+                                # 삭제할 구간 설정
+                                start_1 = indices_high[0]  # 시작 구간 1
+                                end_1 = indices_low[idx_diff_low[0]]  # 끝 구간 1
+                                start_2 = indices_low[idx_diff_low[0] + 1]  # 시작 구간 2
+                                end_2 = indices_high[-1]  # 끝 구간 2
+
+                                # start_1 ~ end_2 구간에 6.1을 더하기
+                                data[0][start_1:end_2 + 1] += 6.1  # 해당 구간에 6.1 추가
+
+                                # 필터링을 위한 마스크 생성
+                                indices_all = np.arange(len(data[0]))  # 전체 인덱스 생성
+                                mask = ~((indices_all >= start_1) & (indices_all <= end_1) | (indices_all >= start_2) & (indices_all <= end_2))
+
+                                # 특정 구간 제거
+                                x_data = data[0][mask]
+                                nor_x = x_data - data[0][0]
+                                label_array = label_array[mask]
+                                
+                                print(f"After 0600 processing: data length {len(x_data)}, label length {len(label_array)}")
+                        except Exception as e:
+                            print(f"⚠️ 예외 발생 (ind: {ind}, i: {i}) - {e}")
+                            pass  # 예외가 발생해도 무시하고 계속 진행
+                    
+                    # 🔍 길이 체크
+                    if len(nor_x) == 0:
+                        print(f"⚠️ Empty data after processing {ind}_{i}")
+                        continue
+                    
+                    # 🔍 레이블 체크
+                    if np.all(label_array == 0):
+                        print(f"⚠️ All zero labels for {ind}_{i}")
+                        # 최소한의 레이블 생성
+                        mid_point = len(label_array) // 2
+                        label_array[mid_point-10:mid_point+10] = 0.1
+                    
+                    # 스무딩 적용
+                    label_tensor = torch.tensor(label_array, dtype=torch.float32).unsqueeze(0).unsqueeze(0)
+                    smoothed_signal = smooth_label_signal(label_tensor, kernel_size=10001, sigma=500.0)
+                    smoothed_signal = smoothed_signal.squeeze(0).squeeze(0)
+                    
+                    print(f"After smoothing: min={smoothed_signal.min():.6f}, max={smoothed_signal.max():.6f}")
+                    
+                    # 🔧 안전한 정규화
+                    max_val = smoothed_signal.max()
+                    if max_val > 1e-6:  # 매우 작은 값이 아닌 경우만 정규화
+                        smoothed_signal = smoothed_signal / max_val
+                    else:
+                        print(f"⚠️ Max value too small ({max_val:.2e}), skipping normalization")
+                        smoothed_signal = torch.ones_like(smoothed_signal) * 0.01
+                    
+                    print(f"After normalization: min={smoothed_signal.min():.6f}, max={smoothed_signal.max():.6f}")
+                    
+                    # 랜덤 값 대체
+                    smoothed_signal = replace_zeros_with_random_torch(smoothed_signal, low=0.01, high=0.1)
+                    
+                    print(f"After random replace: min={smoothed_signal.min():.6f}, max={smoothed_signal.max():.6f}")
+                    
+                    # 🔧 최종 안전성 체크 및 클리핑
+                    if torch.isnan(smoothed_signal).any():
+                        print("⚠️ NaN detected in smoothed_signal!")
+                        continue
+                    if torch.isinf(smoothed_signal).any():
+                        print("⚠️ Inf detected in smoothed_signal!")
+                        continue
+                    
+                    # BCE 범위로 클리핑
+                    smoothed_signal = torch.clamp(smoothed_signal, 0.0, 1.0)
+                    print(f"After clipping: min={smoothed_signal.min():.6f}, max={smoothed_signal.max():.6f}")
+                    
+                    # 시퀀스 생성
+                    valid_count = 0
+                    for j in range(seq_len, len(nor_x) - seq_len):
+                        x_win = nor_x[j - seq_len : j]
+                        
+                        # 🔍 입력 데이터 유효성 체크
+                        if np.isnan(x_win).any() or np.isinf(x_win).any():
+                            continue
+                        
+                        y_win = smoothed_signal[j]
+                        
+                        # 🔍 레이블 유효성 체크  
+                        if torch.isnan(y_win) or torch.isinf(y_win):
+                            continue
+                        
+                        x_seq.append(torch.tensor(x_win, dtype=torch.float32))
+                        y_seq.append(torch.tensor(y_win.item(), dtype=torch.float32))  # .item()으로 스칼라 변환
+                        valid_count += 1
+                    
+                    print(f'{ind}_{i} file processed. Data length: {len(nor_x)}, Valid sequences: {valid_count}')
+                    
+            except Exception as e:
+                print(f"⚠️ Error processing {ind}_{i}: {e}")
+                continue
+    
+    print(f'Total sequences: {len(x_seq)}')
+    return x_seq, y_seq
+
+# ===================== 데이터셋 클래스 (기존과 동일) =====================
+class train_bin_dataset(Dataset):
+    def __init__(self, file_dir, seq_len):
+        self.needle_dis = ['0800', '1000']  # 0600 제거
+        self.seq_len = seq_len
+        self.x_seq = []
+        self.y_seq = []
+        self.range_list = [i for i in range(1, 19)]
+        self.file_dir = file_dir
+        
+        self.x_seq, self.y_seq = Data_preprocessing(self.needle_dis, self.seq_len, file_dir, self.range_list)
+        
+    def __len__(self):
+        return len(self.y_seq)
+    
+    def __getitem__(self, idx):
+        return self.x_seq[idx], self.y_seq[idx]               
+    
+class val_bin_dataset(Dataset):
+    def __init__(self, file_dir, seq_len):
+        self.needle_dis = ['0800', '1000']  # 0600 제거
+        self.seq_len = seq_len
+        self.x_seq = []
+        self.y_seq = []
+        self.range_list = [i for i in range(18, 21)]
+        self.file_dir = file_dir
+        
+        self.x_seq, self.y_seq = Data_preprocessing(self.needle_dis, self.seq_len, file_dir, self.range_list)
+        
+    def __len__(self):
+        return len(self.y_seq)
+    
+    def __getitem__(self, idx):
+        return self.x_seq[idx], self.y_seq[idx]
+
+# ===================== ResNet1D 모델 정의 =====================
+class BasicBlock1D(nn.Module):
+    """ResNet의 기본 블록을 1D로 변환"""
+    expansion = 1
+    
+    def __init__(self, in_channels, out_channels, stride=1, downsample=None):
+        super(BasicBlock1D, self).__init__()
+        
+        # 첫 번째 컨볼루션
+        self.conv1 = nn.Conv1d(in_channels, out_channels, kernel_size=3, 
+                              stride=stride, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm1d(out_channels)
+        
+        # 두 번째 컨볼루션
+        self.conv2 = nn.Conv1d(out_channels, out_channels, kernel_size=3, 
+                              stride=1, padding=1, bias=False)
+        self.bn2 = nn.BatchNorm1d(out_channels)
+        
+        self.relu = nn.ReLU(inplace=True)
+        self.downsample = downsample
+        
+    def forward(self, x):
+        identity = x
+        
+        # 첫 번째 컨볼루션
+        out = self.conv1(x)
+        out = self.bn1(out)
+        out = self.relu(out)
+        
+        # 두 번째 컨볼루션
+        out = self.conv2(out)
+        out = self.bn2(out)
+        
+        # Skip connection
+        if self.downsample is not None:
+            identity = self.downsample(x)
+        
+        out += identity
+        out = self.relu(out)
+        
+        return out
+
+class ResNet1D(nn.Module):
+    """1D ResNet for Puncture Detection"""
+    def __init__(self, block, layers, num_classes=1, input_channels=1):
+        super(ResNet1D, self).__init__()
+        
+        self.in_channels = 64
+        
+        # 초기 컨볼루션 레이어
+        self.conv1 = nn.Conv1d(input_channels, 64, kernel_size=7, 
+                              stride=2, padding=3, bias=False)
+        self.bn1 = nn.BatchNorm1d(64)
+        self.relu = nn.ReLU(inplace=True)
+        self.maxpool = nn.MaxPool1d(kernel_size=3, stride=2, padding=1)
+        
+        # ResNet 블록들
+        self.layer1 = self._make_layer(block, 64, layers[0])
+        self.layer2 = self._make_layer(block, 128, layers[1], stride=2)
+        self.layer3 = self._make_layer(block, 256, layers[2], stride=2)
+        self.layer4 = self._make_layer(block, 512, layers[3], stride=2)
+        
+        # 글로벌 평균 풀링
+        self.avgpool = nn.AdaptiveAvgPool1d(1)
+        
+        # 분류 헤드
+        self.fc = nn.Sequential(
+            nn.Linear(512 * block.expansion, 256),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.3),
+            nn.Linear(256, 128),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.2),
+            nn.Linear(128, num_classes)
+        )
+        
+        # 가중치 초기화
+        self._initialize_weights()
+        
+    def _make_layer(self, block, out_channels, blocks, stride=1):
+        downsample = None
+        if stride != 1 or self.in_channels != out_channels * block.expansion:
+            downsample = nn.Sequential(
+                nn.Conv1d(self.in_channels, out_channels * block.expansion,
+                         kernel_size=1, stride=stride, bias=False),
+                nn.BatchNorm1d(out_channels * block.expansion),
+            )
+        
+        layers = []
+        layers.append(block(self.in_channels, out_channels, stride, downsample))
+        self.in_channels = out_channels * block.expansion
+        
+        for _ in range(1, blocks):
+            layers.append(block(self.in_channels, out_channels))
+        
+        return nn.Sequential(*layers)
+    
+    def _initialize_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Conv1d):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+            elif isinstance(m, nn.BatchNorm1d):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.Linear):
+                nn.init.normal_(m.weight, 0, 0.01)
+                nn.init.constant_(m.bias, 0)
+    
+    def forward(self, x):
+        # 입력 차원 확인 및 조정: [batch_size, seq_len] -> [batch_size, 1, seq_len]
+        if len(x.shape) == 2:
+            x = x.unsqueeze(1)
+        
+        # 초기 컨볼루션
+        x = self.conv1(x)
+        x = self.bn1(x)
+        x = self.relu(x)
+        x = self.maxpool(x)
+        
+        # ResNet 블록들
+        x = self.layer1(x)
+        x = self.layer2(x)
+        x = self.layer3(x)
+        x = self.layer4(x)
+        
+        # 글로벌 평균 풀링
+        x = self.avgpool(x)
+        x = torch.flatten(x, 1)
+        
+        # 분류
+        x = self.fc(x)
+        
+        return x.squeeze(-1)  # [batch_size, 1] -> [batch_size]
+
+def resnet18_1d(num_classes=1, input_channels=1):
+    """ResNet-18을 1D로 변환"""
+    return ResNet1D(BasicBlock1D, [2, 2, 2, 2], num_classes, input_channels)
+
+def resnet34_1d(num_classes=1, input_channels=1):
+    """ResNet-34를 1D로 변환"""
+    return ResNet1D(BasicBlock1D, [3, 4, 6, 3], num_classes, input_channels)
+
+# ===================== 학습 및 평가 함수 =====================
+def train_epoch(train_dl, model, criterion, optimizer):
+   """한 에포크 학습"""
+   model.train()
+   epoch_loss = 0
+   total_batches = len(train_dl)
+   
+   for batch_idx, (X, y) in enumerate(train_dl):
+       optimizer.zero_grad()
+       
+       # 데이터를 GPU로 이동
+       X = X.to(device)  # [batch_size, seq_len]
+       y = y.to(device).float()  # [batch_size]
+       
+       # Forward pass
+       pred = model(X)  # [batch_size]
+       loss = criterion(pred, y)
+       
+       # Backward pass
+       loss.backward()
+       
+       # 그래디언트 클리핑 (선택사항)
+       torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+       
+       optimizer.step()
+       
+       epoch_loss += loss.item()
+   
+   return epoch_loss / total_batches
+
+def validate_epoch(val_dl, model, criterion):
+    """검증 에포크"""
+    model.eval()
+    epoch_loss = 0
+    all_preds = []
+    all_labels = []
+    
+    with torch.no_grad():
+        for X, y in val_dl:
+            X = X.to(device)
+            y = y.to(device).float()
+            
+            # Forward pass
+            pred = model(X)
+            loss = criterion(pred, y)
+            
+            epoch_loss += loss.item()
+            
+            # 확률로 변환
+            probas = torch.sigmoid(pred)
+            
+            # 결과 수집
+            all_preds.extend(probas.cpu().numpy())
+            all_labels.extend(y.cpu().numpy())
+    
+    # 메트릭 계산
+    avg_loss = epoch_loss / len(val_dl)
+    
+    # 이진 분류 AUC 계산
+    try:
+        binary_labels = [1 if label > 0.8 else 0 for label in all_labels]
+        if len(set(binary_labels)) > 1:
+            auc_score = roc_auc_score(binary_labels, all_preds)
+        else:
+            auc_score = 0.0
+    except Exception as e:
+        print(f"⚠️ AUC 계산 오류: {e}")
+        auc_score = 0.0
+    
+    return avg_loss, auc_score, all_preds, all_labels
+
+# ===================== 메인 실행 부분 =====================
+if __name__ == "__main__":
+    print("🚀 ResNet1D 기반 Puncture Detection 시작!")
+    print("="*60)
+    
+    # 데이터 로딩
+    file_dir = '/home/ibom002/dataset/Data_20250709'
+    seq_len = 512
+    batch_size = 256  # ResNet은 LSTM보다 메모리 효율적
+    
+    print("데이터 로딩 중...")
+    train_ds = train_bin_dataset(file_dir, seq_len)
+    val_ds = val_bin_dataset(file_dir, seq_len)
+    
+    print(f'Train dataset size: {len(train_ds)}')
+    print(f'Validation dataset size: {len(val_ds)}')
+    
+    # 클래스 불균형 해결을 위한 가중 샘플링
+    binary_labels = [1 if y.item() > 0.8 else 0 for _, y in train_ds]
+    class_counts = [binary_labels.count(0), binary_labels.count(1)]
+    class_weights = [1.0 / class_counts[0], 1.0 / class_counts[1]]
+    
+    print(f"클래스 분포 - 음성: {class_counts[0]}, 양성: {class_counts[1]}")
+    print(f"클래스 가중치 - 음성: {class_weights[0]:.4f}, 양성: {class_weights[1]:.4f}")
+    
+    # 샘플 가중치 설정
+    weights = [class_weights[label] for label in binary_labels]
+    sampler = WeightedRandomSampler(weights, num_samples=len(weights), replacement=True)
+    
+    # 데이터 로더 생성
+    train_dl = DataLoader(train_ds, batch_size=batch_size, sampler=sampler, 
+                         shuffle=False, drop_last=True, num_workers=4)
+    val_dl = DataLoader(val_ds, batch_size=batch_size, shuffle=False, 
+                       drop_last=True, num_workers=4)
+    
+    print(f'Train batches: {len(train_dl)}')
+    print(f'Validation batches: {len(val_dl)}')
+    
+    # 모델 생성
+    print("\n모델 생성 중...")
+    model = resnet18_1d(num_classes=1, input_channels=1)
+    
+    # Multi-GPU 설정
+    if torch.cuda.device_count() > 1:
+        print(f"🚀 Using {torch.cuda.device_count()} GPUs with DataParallel!")
+        model = nn.DataParallel(model)
+    
+    model = model.to(device)
+    
+    # 모델 정보 출력
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"총 파라미터: {total_params:,}")
+    print(f"학습 가능 파라미터: {trainable_params:,}")
+    
+    # 옵티마이저 및 손실함수 설정
+    optimizer = optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-4)
+    criterion = nn.BCEWithLogitsLoss()
+    
+    # 학습률 스케줄러
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='min', factor=0.5, patience=3)
+    
+    # 조기 종료 설정
+    patience = 7
+    best_val_loss = float('inf')
+    early_stop_counter = 0
+    min_delta = 0.0001
+    
+    # 결과 저장용 리스트
+    train_losses = []
+    val_losses = []
+    val_aucs = []
+    
+    # 학습 시작
+    print("\n🚀 학습 시작!")
+    print("="*60)
+    
+    num_epochs = 50
+    
+    for epoch in range(num_epochs):
+        print(f"\n📍 Epoch {epoch+1}/{num_epochs}")
+        print("-" * 40)
+        
+        # 학습
+        train_loss = train_epoch(train_dl, model, criterion, optimizer)
+        print(f"훈련 손실: {train_loss:.6f}")
+        
+        # 검증
+        val_loss, val_auc, val_preds, val_labels = validate_epoch(val_dl, model, criterion)
+        print(f"검증 손실: {val_loss:.6f}")
+        print(f"검증 AUC: {val_auc:.5f}")
+        
+        # 결과 저장
+        train_losses.append(train_loss)
+        val_losses.append(val_loss)
+        val_aucs.append(val_auc)
+        
+        # 학습률 스케줄러 업데이트
+        scheduler.step(val_loss)
+        current_lr = optimizer.param_groups[0]['lr']
+        print(f"현재 학습률: {current_lr:.2e}")
+        
+        # 조기 종료 체크
+        if val_loss < (best_val_loss - min_delta):
+            best_val_loss = val_loss
+            early_stop_counter = 0
+            
+            # 최고 모델 저장
+            model_save_path = "./model/best_resnet1d_model.pth"
+            os.makedirs("./model", exist_ok=True)
+            torch.save(model.state_dict(), model_save_path)
+            print(f"✅ 최고 성능 모델 저장! 검증 손실: {best_val_loss:.6f}")
+        else:
+            early_stop_counter += 1
+            print(f"⚠️ 조기 종료 카운터: {early_stop_counter}/{patience}")
+        
+        if early_stop_counter >= patience:
+            print("⏹ 조기 종료 활성화!")
+            break
+    
+    print("\n🎯 학습 완료!")
+    print(f"최고 검증 손실: {best_val_loss:.6f}")
+    print(f"최고 검증 AUC: {max(val_aucs):.5f}")
+    
