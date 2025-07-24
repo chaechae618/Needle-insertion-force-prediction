@@ -1,0 +1,1 @@
+This project aims to develop an AI-based model that predicts the exact moment when a needle reaches the nerve during spinal procedures, based on time-series optical signals. By accurately detecting the puncture point, the system enhances procedural safety and enables real-time feedback, serving as a core technology for automated surgical assistance.
